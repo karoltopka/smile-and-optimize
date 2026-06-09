@@ -148,6 +148,29 @@ class JobResult:
 
 
 @dataclass
+class PrepResult:
+    """Outcome of phase 1: SMILES → 3D coordinates → .mop file."""
+
+    compound_id: str
+    smiles: str
+    status: str = "failed"  # ready | failed | skipped
+    mop_file: Optional[Path] = None
+    error_message: Optional[str] = None
+    duration: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        """Serialise to a flat dict suitable for a pandas DataFrame row."""
+        return {
+            "compound_id": self.compound_id,
+            "smiles": self.smiles,
+            "status": self.status,
+            "mop_file": str(self.mop_file) if self.mop_file else None,
+            "error_message": self.error_message,
+            "duration_s": round(self.duration, 3) if self.duration is not None else None,
+        }
+
+
+@dataclass
 class CommandResult:
     """Result of a subprocess call."""
 
@@ -641,81 +664,63 @@ def run_mopac(
 
 
 # ---------------------------------------------------------------------------
-# Single-molecule pipeline
+# Phase 1: SMILES → 3D coordinates → .mop file
 # ---------------------------------------------------------------------------
 
 
-def process_one_molecule(
+def prepare_one_molecule(
     job: MoleculeJob,
     overwrite: bool = False,
     obabel_timeout: int = 120,
-    mopac_timeout: Optional[int] = 600,
     obabel_options: Optional[list[str]] = None,
-) -> JobResult:
-    """Execute the complete SMILES → 3D → MOPAC pipeline for one compound.
+) -> PrepResult:
+    """Run phase 1 of the pipeline for one compound: SMILES → .mop file.
 
     Steps:
 
     1. Guard against blank SMILES.
     2. Create the job directory.
-    3. Skip early if a ``.out`` file already exists and *overwrite* is False.
+    3. Skip early if a ``.mop`` file already exists and *overwrite* is False.
     4. Write the ``.smi`` input file for Open Babel.
-    5. Run Open Babel to produce a 3D ``.xyz`` file.
-    6. Parse the ``.xyz`` file.
+    5. Run Open Babel to produce a 3D ``.xyz`` file (with automatic fallbacks).
+    6. Parse and validate the ``.xyz`` file.
     7. Write the MOPAC ``.mop`` input file.
-    8. Run MOPAC.
-    9. Collect output paths and return a :class:`JobResult`.
-
-    Any per-step error is stored in :attr:`JobResult.error_message`; the
-    overall batch loop is never interrupted by a single compound's failure.
 
     Args:
         job:             Molecule inputs encapsulated in :class:`MoleculeJob`.
-        overwrite:       When False, skip if a ``.out`` file already exists.
+        overwrite:       When False, skip if a ``.mop`` file already exists.
         obabel_timeout:  Timeout (s) for the Open Babel subprocess.
-        mopac_timeout:   Timeout (s) for the MOPAC subprocess; ``None`` = no
-                         limit.
         obabel_options:  Extra CLI flags forwarded to obabel.
 
     Returns:
-        :class:`JobResult` summarising the outcome of this compound.
+        :class:`PrepResult` with ``status`` ``"ready"``, ``"failed"``, or
+        ``"skipped"``.
     """
-    result = JobResult(compound_id=job.compound_id, smiles=job.smiles)
+    result = PrepResult(compound_id=job.compound_id, smiles=job.smiles)
 
-    # -- Guard: blank SMILES ------------------------------------------------
     if not (job.smiles or "").strip():
         result.error_message = "Empty or blank SMILES string."
-        return result  # status remains "failed"
+        return result
 
-    # -- Create job directory -----------------------------------------------
     job.job_dir.mkdir(parents=True, exist_ok=True)
-
     mop_file = job.job_dir / f"{job.compound_id}.mop"
-    out_file = job.job_dir / f"{job.compound_id}.out"
-    arc_file = job.job_dir / f"{job.compound_id}.arc"
 
-    # -- Skip existing results when overwrite=False -------------------------
-    if not overwrite and out_file.exists():
+    if not overwrite and mop_file.exists():
         result.status = "skipped"
-        result.mop_file = mop_file if mop_file.exists() else None
-        result.out_file = out_file
-        result.arc_file = arc_file if arc_file.exists() else None
-        logger.info("[%s] Skipped — .out file already exists.", job.compound_id)
+        result.mop_file = mop_file
+        logger.info("[%s] Skipped — .mop file already exists.", job.compound_id)
         return result
 
     t0 = time.monotonic()
 
-    # -- Step 1: write SMILES file ------------------------------------------
     smi_file = job.job_dir / "input.smi"
     try:
         write_smiles_file(job.smiles, job.compound_id, smi_file)
     except OSError as exc:
         result.error_message = f"Cannot write SMILES file: {exc}"
+        result.duration = time.monotonic() - t0
         return result
 
-    # -- Steps 2–3: generate 3D coordinates + parse XYZ (with fallbacks) -----
-    # Build the ordered list of option sets to try: caller-supplied first,
-    # then each entry from OBABEL_FALLBACK_OPTIONS.
     primary = obabel_options if obabel_options is not None else list(OBABEL_DEFAULT_OPTIONS)
     option_sets = [primary] + OBABEL_FALLBACK_OPTIONS
 
@@ -737,7 +742,7 @@ def process_one_molecule(
 
         if obabel_res.timed_out:
             attempt_error = f"Open Babel timed out after {obabel_timeout}s."
-            break  # timeout is not recoverable by retrying
+            break
 
         if obabel_res.returncode != 0:
             attempt_error = (
@@ -768,7 +773,6 @@ def process_one_molecule(
             logger.debug("[%s] attempt %d: %s", job.compound_id, attempt, attempt_error)
             continue
 
-        # This attempt succeeded.
         atoms = parsed
         if attempt > 1:
             logger.info(
@@ -780,9 +784,9 @@ def process_one_molecule(
 
     if not atoms:
         result.error_message = attempt_error
+        result.duration = time.monotonic() - t0
         return result
 
-    # -- Step 4: write .mop -------------------------------------------------
     try:
         write_mop_file(
             mop_file=mop_file,
@@ -795,50 +799,157 @@ def process_one_molecule(
         )
     except OSError as exc:
         result.error_message = f"Cannot write .mop file: {exc}"
+        result.duration = time.monotonic() - t0
         return result
 
+    result.status = "ready"
     result.mop_file = mop_file
+    result.duration = time.monotonic() - t0
+    logger.info("[%s] Prepared in %.2fs.", job.compound_id, result.duration)
+    return result
 
-    # -- Step 5: run MOPAC --------------------------------------------------
-    logger.info("[%s] Running MOPAC ...", job.compound_id)
-    mopac_res = run_mopac(mop_file, timeout=mopac_timeout)
+
+# ---------------------------------------------------------------------------
+# Phase 2: run MOPAC on a single .mop file
+# ---------------------------------------------------------------------------
+
+
+def _run_mopac_one(
+    mop_file: Path,
+    timeout: Optional[int] = 600,
+    overwrite: bool = False,
+) -> JobResult:
+    """Run MOPAC on a single prepared ``.mop`` file.
+
+    Reads the compound identifier and original SMILES from the ``.mop`` header
+    (line 2 has the form ``<id>  SMILES: <smiles>``).
+
+    Args:
+        mop_file:  Absolute path to the ``.mop`` input file.
+        timeout:   Seconds before MOPAC is killed; ``None`` = no limit.
+        overwrite: When False, skip if a ``.out`` file already exists.
+
+    Returns:
+        :class:`JobResult` summarising the MOPAC run.
+    """
+    compound_id = mop_file.stem
+    smiles = ""
+    try:
+        lines = mop_file.read_text(encoding="utf-8", errors="replace").splitlines()
+        if len(lines) >= 2 and "SMILES:" in lines[1]:
+            smiles = lines[1].split("SMILES:", 1)[1].strip()
+    except OSError:
+        pass
+
+    out_file = mop_file.parent / f"{compound_id}.out"
+    arc_file = mop_file.parent / f"{compound_id}.arc"
+
+    result = JobResult(compound_id=compound_id, smiles=smiles, mop_file=mop_file)
+
+    if not overwrite and out_file.exists():
+        result.status = "skipped"
+        result.out_file = out_file
+        result.arc_file = arc_file if arc_file.exists() else None
+        logger.info("[%s] Skipped — .out file already exists.", compound_id)
+        return result
+
+    t0 = time.monotonic()
+    logger.info("[%s] Running MOPAC ...", compound_id)
+    mopac_res = run_mopac(mop_file, timeout=timeout)
 
     result.return_code = mopac_res.returncode
     result.duration = time.monotonic() - t0
 
     if mopac_res.timed_out:
         result.status = "timeout"
-        result.error_message = f"MOPAC timed out after {mopac_timeout}s."
-        logger.warning("[%s] MOPAC timed out.", job.compound_id)
+        result.error_message = f"MOPAC timed out after {timeout}s."
+        logger.warning("[%s] MOPAC timed out.", compound_id)
         return result
 
-    # -- Collect output files -----------------------------------------------
     result.out_file = out_file if out_file.exists() else None
     result.arc_file = arc_file if arc_file.exists() else None
 
     if result.out_file is None:
         result.status = "failed"
         result.error_message = (
-            f"MOPAC finished (rc={mopac_res.returncode}) but no .out file was "
-            f"produced.  stderr: {mopac_res.stderr.strip()[:400]}"
+            f"MOPAC finished (rc={mopac_res.returncode}) but no .out file was produced. "
+            f"stderr: {mopac_res.stderr.strip()[:400]}"
         )
         return result
 
     if mopac_res.returncode != 0:
-        # .out exists but MOPAC signalled failure — record as failed but keep
-        # both output paths so the user can inspect them.
         result.status = "failed"
         result.error_message = (
             f"MOPAC exited with rc={mopac_res.returncode}. "
             f"Inspect {out_file.name} for details."
         )
-        logger.warning(
-            "[%s] MOPAC rc=%d.", job.compound_id, mopac_res.returncode
-        )
+        logger.warning("[%s] MOPAC rc=%d.", compound_id, mopac_res.returncode)
         return result
 
     result.status = "success"
-    logger.info("[%s] Done in %.2fs.", job.compound_id, result.duration)
+    logger.info("[%s] Done in %.2fs.", compound_id, result.duration)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Combined single-molecule pipeline (used by run_pipeline)
+# ---------------------------------------------------------------------------
+
+
+def process_one_molecule(
+    job: MoleculeJob,
+    overwrite: bool = False,
+    obabel_timeout: int = 120,
+    mopac_timeout: Optional[int] = 600,
+    obabel_options: Optional[list[str]] = None,
+) -> JobResult:
+    """Execute the complete SMILES → 3D → MOPAC pipeline for one compound.
+
+    Delegates to :func:`prepare_one_molecule` (phase 1) and
+    :func:`_run_mopac_one` (phase 2).  Skip logic for the combined pipeline
+    is based on whether a ``.out`` file already exists (i.e. MOPAC has
+    already run), not whether a ``.mop`` file exists.
+
+    Args:
+        job:             Molecule inputs encapsulated in :class:`MoleculeJob`.
+        overwrite:       When False, skip if a ``.out`` file already exists.
+        obabel_timeout:  Timeout (s) for the Open Babel subprocess.
+        mopac_timeout:   Timeout (s) for the MOPAC subprocess; ``None`` = no
+                         limit.
+        obabel_options:  Extra CLI flags forwarded to obabel.
+
+    Returns:
+        :class:`JobResult` summarising the outcome of this compound.
+    """
+    out_file = job.job_dir / f"{job.compound_id}.out"
+    arc_file = job.job_dir / f"{job.compound_id}.arc"
+    mop_file = job.job_dir / f"{job.compound_id}.mop"
+
+    # Combined-pipeline skip: based on .out, not .mop.
+    if not overwrite and out_file.exists():
+        result = JobResult(compound_id=job.compound_id, smiles=job.smiles)
+        result.status = "skipped"
+        result.mop_file = mop_file if mop_file.exists() else None
+        result.out_file = out_file
+        result.arc_file = arc_file if arc_file.exists() else None
+        logger.info("[%s] Skipped — .out file already exists.", job.compound_id)
+        return result
+
+    # Phase 1: always regenerate the .mop when we are not skipping.
+    prep = prepare_one_molecule(
+        job, overwrite=True, obabel_timeout=obabel_timeout, obabel_options=obabel_options
+    )
+
+    if prep.status == "failed":
+        result = JobResult(compound_id=job.compound_id, smiles=job.smiles)
+        result.error_message = prep.error_message
+        result.duration = prep.duration
+        return result
+
+    # Phase 2: run MOPAC (always, since we just wrote a fresh .mop).
+    result = _run_mopac_one(prep.mop_file, timeout=mopac_timeout, overwrite=True)
+    # Total duration = obabel time + MOPAC time.
+    result.duration = (prep.duration or 0.0) + (result.duration or 0.0)
     return result
 
 
@@ -943,11 +1054,253 @@ def _build_job_list(
 
 
 # ---------------------------------------------------------------------------
-# Public batch entry point
+# Public batch entry points
 # ---------------------------------------------------------------------------
 
 
+def prepare_batch(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: Optional[str] = None,
+    keywords: str = "PM7 PRECISE GEO-OK",
+    workdir: "str | Path" = "mopac_jobs",
+    charge_col: Optional[str] = None,
+    multiplicity_col: Optional[str] = None,
+    overwrite: bool = False,
+    obabel_options: Optional[list[str]] = None,
+    obabel_timeout: int = 120,
+    max_workers: int = 1,
+) -> pd.DataFrame:
+    """Phase 1 batch: SMILES → 3D coordinates → ``.mop`` files.
+
+    For each row the function generates a job directory, converts the SMILES
+    to a 3D XYZ structure with Open Babel (with automatic fallbacks), and
+    writes a MOPAC ``.mop`` input file.  No MOPAC calculations are performed.
+
+    Run :func:`run_mopac_batch` afterwards to submit the prepared jobs to
+    MOPAC.
+
+    Args:
+        df:               Input DataFrame.  Must contain *smiles_col*.
+        smiles_col:       Column name holding SMILES strings.
+        id_col:           Optional column to use as compound identifiers.
+                          When omitted, sequential IDs ``mol_000001`` …
+                          are generated.
+        keywords:         MOPAC keyword string written as the first line of
+                          every ``.mop`` file.
+        workdir:          Root directory for all job subdirectories and for
+                          ``prepare_results.csv``.
+        charge_col:       Optional column containing formal integer charges.
+        multiplicity_col: Optional column containing spin multiplicities (2S+1).
+        overwrite:        Re-generate even when a ``.mop`` file already exists.
+        obabel_options:   Extra CLI flags forwarded to obabel.
+                          Default: ``["--gen3d"]``.
+        obabel_timeout:   Per-compound timeout for the Open Babel subprocess.
+        max_workers:      Number of parallel worker threads.
+
+    Returns:
+        DataFrame with columns: ``compound_id``, ``smiles``, ``status``
+        (``ready`` / ``failed`` / ``skipped``), ``mop_file``,
+        ``error_message``, ``duration_s``.  Also saved to
+        ``<workdir>/prepare_results.csv``.
+
+    Raises:
+        EnvironmentError: If ``obabel`` is not found in PATH.
+        KeyError:         If a referenced column is absent from *df*.
+    """
+    if shutil.which("obabel") is None:
+        raise EnvironmentError(
+            "obabel not found in PATH. Install Open Babel and ensure it is on "
+            "your system PATH, then retry."
+        )
+
+    workdir = Path(workdir).resolve()
+    workdir.mkdir(parents=True, exist_ok=True)
+
+    optional_cols = [c for c in (id_col, charge_col, multiplicity_col) if c]
+    missing_cols = [c for c in [smiles_col, *optional_cols] if c not in df.columns]
+    if missing_cols:
+        raise KeyError(
+            f"Column(s) not found in DataFrame: {missing_cols}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    jobs = _build_job_list(
+        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col
+    )
+    n = len(jobs)
+
+    prep_kwargs = dict(
+        overwrite=overwrite,
+        obabel_timeout=obabel_timeout,
+        obabel_options=obabel_options,
+    )
+
+    results: list[Optional[PrepResult]] = [None] * n
+
+    if max_workers == 1:
+        for idx, job in enumerate(jobs):
+            logger.info("[%d/%d] %s", idx + 1, n, job.compound_id)
+            try:
+                results[idx] = prepare_one_molecule(job=job, **prep_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[%s] Unexpected exception: %s", job.compound_id, exc)
+                results[idx] = PrepResult(
+                    compound_id=job.compound_id, smiles=job.smiles,
+                    status="failed", error_message=f"Unexpected exception: {exc}",
+                )
+    else:
+        logger.info("Parallel prepare: %d jobs across %d workers.", n, max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {
+                pool.submit(prepare_one_molecule, job=job, **prep_kwargs): idx
+                for idx, job in enumerate(jobs)
+            }
+            completed = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                completed += 1
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        "[%s] Unexpected exception: %s", jobs[idx].compound_id, exc,
+                    )
+                    results[idx] = PrepResult(
+                        compound_id=jobs[idx].compound_id,
+                        smiles=jobs[idx].smiles,
+                        status="failed",
+                        error_message=f"Unexpected exception: {exc}",
+                    )
+                logger.info(
+                    "[%d/%d] %s — %s",
+                    completed, n, results[idx].compound_id, results[idx].status,
+                )
+
+    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
+        columns=["compound_id", "smiles", "status", "mop_file", "error_message", "duration_s"]
+    )
+
+    csv_path = workdir / "prepare_results.csv"
+    results_df.to_csv(csv_path, index=False)
+    ready = (results_df["status"] == "ready").sum()
+    logger.info(
+        "Prepare finished — %d compound(s), %d ready.  Results → %s", n, ready, csv_path
+    )
+    return results_df
+
+
 def run_mopac_batch(
+    workdir: "str | Path",
+    overwrite: bool = False,
+    timeout: Optional[int] = 600,
+    max_workers: int = 1,
+) -> pd.DataFrame:
+    """Phase 2 batch: run MOPAC on all ``.mop`` files found in *workdir*.
+
+    Scans ``<workdir>/*/*.mop`` for prepared input files (as written by
+    :func:`prepare_batch`) and submits each to MOPAC.  The compound
+    identifier and original SMILES are read from the ``.mop`` header so no
+    DataFrame is required.
+
+    Args:
+        workdir:     Root directory that was used for :func:`prepare_batch`.
+                     All ``<id>/<id>.mop`` files beneath it are discovered
+                     automatically.
+        overwrite:   Re-run even when a ``.out`` file already exists.
+        timeout:     Per-compound MOPAC timeout in seconds.  ``None`` = no
+                     limit.
+        max_workers: Number of parallel worker threads.
+
+    Returns:
+        DataFrame with columns: ``compound_id``, ``smiles``, ``status``
+        (``success`` / ``failed`` / ``skipped`` / ``timeout``), ``mop_file``,
+        ``out_file``, ``arc_file``, ``error_message``, ``return_code``,
+        ``duration_s``.  Also saved to ``<workdir>/batch_results.csv``.
+
+    Raises:
+        EnvironmentError: If ``mopac`` is not found in PATH.
+        FileNotFoundError: If *workdir* does not exist.
+    """
+    if shutil.which("mopac") is None:
+        raise EnvironmentError(
+            "mopac not found in PATH. Install MOPAC and ensure it is on your "
+            "system PATH, then retry."
+        )
+
+    workdir = Path(workdir).resolve()
+    if not workdir.exists():
+        raise FileNotFoundError(f"workdir does not exist: {workdir}")
+
+    mop_files = sorted(workdir.glob("*/*.mop"))
+    n = len(mop_files)
+    if n == 0:
+        logger.warning("No .mop files found under %s — nothing to run.", workdir)
+        return pd.DataFrame(
+            columns=[
+                "compound_id", "smiles", "status",
+                "mop_file", "out_file", "arc_file",
+                "error_message", "return_code", "duration_s",
+            ]
+        )
+
+    logger.info("Found %d .mop file(s) in %s.", n, workdir)
+
+    run_kwargs = dict(timeout=timeout, overwrite=overwrite)
+    results: list[Optional[JobResult]] = [None] * n
+
+    if max_workers == 1:
+        for idx, mop_file in enumerate(mop_files):
+            logger.info("[%d/%d] %s", idx + 1, n, mop_file.stem)
+            try:
+                results[idx] = _run_mopac_one(mop_file, **run_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[%s] Unexpected exception: %s", mop_file.stem, exc)
+                results[idx] = JobResult(
+                    compound_id=mop_file.stem, smiles="",
+                    status="failed", error_message=f"Unexpected exception: {exc}",
+                )
+    else:
+        logger.info("Parallel MOPAC: %d jobs across %d workers.", n, max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {
+                pool.submit(_run_mopac_one, mop_file, **run_kwargs): idx
+                for idx, mop_file in enumerate(mop_files)
+            }
+            completed = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                completed += 1
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        "[%s] Unexpected exception: %s", mop_files[idx].stem, exc,
+                    )
+                    results[idx] = JobResult(
+                        compound_id=mop_files[idx].stem, smiles="",
+                        status="failed", error_message=f"Unexpected exception: {exc}",
+                    )
+                logger.info(
+                    "[%d/%d] %s — %s",
+                    completed, n, results[idx].compound_id, results[idx].status,
+                )
+
+    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
+        columns=[
+            "compound_id", "smiles", "status",
+            "mop_file", "out_file", "arc_file",
+            "error_message", "return_code", "duration_s",
+        ]
+    )
+
+    csv_path = workdir / "batch_results.csv"
+    results_df.to_csv(csv_path, index=False)
+    logger.info("MOPAC batch finished — %d compound(s).  Results → %s", n, csv_path)
+    return results_df
+
+
+def run_pipeline(
     df: pd.DataFrame,
     smiles_col: str,
     id_col: Optional[str] = None,
@@ -961,60 +1314,32 @@ def run_mopac_batch(
     obabel_timeout: int = 120,
     max_workers: int = 1,
 ) -> pd.DataFrame:
-    """Run SMILES → Open Babel → MOPAC for every row of a DataFrame.
+    """Combined pipeline: SMILES → Open Babel → MOPAC in a single call.
 
-    For each row the function:
-
-    1. Resolves a compound identifier from *id_col* or generates a sequential
-       one (``mol_000001``, ``mol_000002``, …).
-    2. Creates ``<workdir>/<compound_id>/``.
-    3. Generates a 3D structure with Open Babel (``--gen3d`` by default,
-       with automatic fallback to ``--gen3d dist`` on crashes).
-    4. Writes a MOPAC Cartesian-coordinate input file.
-    5. Executes MOPAC and waits up to *timeout* seconds.
-    6. Records status, output paths, return code, and elapsed time.
-
-    When *max_workers* > 1 the molecule jobs run in a
-    :class:`~concurrent.futures.ThreadPoolExecutor`.  Each job writes to its
-    own subdirectory so there are no filesystem conflicts.  ID deduplication
-    always runs sequentially before the pool is started.
-
-    Individual failures never abort the batch.  At the end the full results
-    table is saved to ``<workdir>/batch_results.csv``.
+    Equivalent to calling :func:`prepare_batch` followed by
+    :func:`run_mopac_batch`.  Use the two-step approach when you want to
+    inspect or edit ``.mop`` files between the geometry generation and the
+    MOPAC run.
 
     Args:
         df:               Input DataFrame.  Must contain *smiles_col*.
         smiles_col:       Column name holding SMILES strings.
         id_col:           Optional column to use as compound identifiers.
-                          When omitted, sequential IDs ``mol_000001`` …
-                          are generated.
-        keywords:         MOPAC keyword string written as the first line of
-                          every ``.mop`` file.
-        workdir:          Root directory for all job subdirectories and for
-                          ``batch_results.csv``.
+        keywords:         MOPAC keyword string (first line of every ``.mop``).
+        workdir:          Root directory for all job subdirectories.
         charge_col:       Optional column containing formal integer charges.
-                          When provided, ``CHARGE=n`` is appended to *keywords*
-                          for non-zero values.
         multiplicity_col: Optional column containing spin multiplicities (2S+1).
-                          When provided, the appropriate MOPAC spin keyword is
-                          appended (see :func:`_build_keywords`).
         overwrite:        Re-run even when a ``.out`` file already exists.
         timeout:          Per-compound MOPAC timeout in seconds.
-                          ``None`` = no limit.
         obabel_options:   Extra CLI flags forwarded to obabel.
-                          Default: ``["--gen3d"]``.
         obabel_timeout:   Per-compound timeout for the Open Babel subprocess.
-        max_workers:      Number of parallel worker threads.  ``1`` (default)
-                          runs sequentially.  A value of ``4``–``8`` is a
-                          reasonable starting point; keep it below the number
-                          of physical CPU cores to avoid memory pressure from
-                          concurrent MOPAC processes.
+        max_workers:      Number of parallel worker threads.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``,
         ``mop_file``, ``out_file``, ``arc_file``, ``error_message``,
-        ``return_code``, ``duration_s``.  Row order matches the input
-        DataFrame regardless of completion order.
+        ``return_code``, ``duration_s``.  Also saved to
+        ``<workdir>/batch_results.csv``.
 
     Raises:
         EnvironmentError: If obabel or mopac is not found in PATH.
@@ -1025,7 +1350,6 @@ def run_mopac_batch(
     workdir = Path(workdir).resolve()
     workdir.mkdir(parents=True, exist_ok=True)
 
-    # -- Column validation --------------------------------------------------
     optional_cols = [c for c in (id_col, charge_col, multiplicity_col) if c]
     missing_cols = [c for c in [smiles_col, *optional_cols] if c not in df.columns]
     if missing_cols:
@@ -1034,13 +1358,11 @@ def run_mopac_batch(
             f"Available columns: {list(df.columns)}"
         )
 
-    # -- Build ordered job list (sequential — deduplicates IDs) ------------
     jobs = _build_job_list(
         df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col
     )
     n = len(jobs)
 
-    # Shared kwargs forwarded to every process_one_molecule call.
     run_kwargs = dict(
         overwrite=overwrite,
         obabel_timeout=obabel_timeout,
@@ -1048,7 +1370,6 @@ def run_mopac_batch(
         obabel_options=obabel_options,
     )
 
-    # -- Execute jobs -------------------------------------------------------
     results: list[Optional[JobResult]] = [None] * n
 
     if max_workers == 1:
@@ -1077,8 +1398,7 @@ def run_mopac_batch(
                     results[idx] = future.result()
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception(
-                        "[%s] Unexpected exception: %s",
-                        jobs[idx].compound_id, exc,
+                        "[%s] Unexpected exception: %s", jobs[idx].compound_id, exc,
                     )
                     results[idx] = JobResult(
                         compound_id=jobs[idx].compound_id,
@@ -1091,22 +1411,17 @@ def run_mopac_batch(
                     completed, n, results[idx].compound_id, results[idx].status,
                 )
 
-    # -- Build results DataFrame --------------------------------------------
-    if results:
-        results_df = pd.DataFrame([r.to_dict() for r in results])
-    else:
-        results_df = pd.DataFrame(
-            columns=[
-                "compound_id", "smiles", "status",
-                "mop_file", "out_file", "arc_file",
-                "error_message", "return_code", "duration_s",
-            ]
-        )
+    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
+        columns=[
+            "compound_id", "smiles", "status",
+            "mop_file", "out_file", "arc_file",
+            "error_message", "return_code", "duration_s",
+        ]
+    )
 
     csv_path = workdir / "batch_results.csv"
     results_df.to_csv(csv_path, index=False)
-    logger.info("Batch finished — %d compound(s).  Results → %s", n, csv_path)
-
+    logger.info("Pipeline finished — %d compound(s).  Results → %s", n, csv_path)
     return results_df
 
 
@@ -1132,16 +1447,26 @@ if __name__ == "__main__":
         }
     )
 
-    results = run_mopac_batch(
+    # Step 1: generate 3D structures and write .mop files.
+    prep = prepare_batch(
         df=sample_df,
         smiles_col="smiles",
         id_col="compound_id",
         keywords="PM7 PRECISE GEO-OK",
         workdir="mopac_jobs",
         overwrite=True,
+    )
+
+    print("\n=== Prepare Results ===")
+    print(prep[["compound_id", "status", "duration_s"]].to_string(index=False))
+
+    # Step 2: run MOPAC on all prepared .mop files.
+    results = run_mopac_batch(
+        workdir="mopac_jobs",
+        overwrite=True,
         timeout=900,
     )
 
-    print("\n=== Batch Results ===")
+    print("\n=== MOPAC Results ===")
     with pd.option_context("display.max_colwidth", 60):
-        print(results.to_string(index=False))
+        print(results[["compound_id", "status", "duration_s"]].to_string(index=False))

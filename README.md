@@ -2,6 +2,14 @@
 
 Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**.
 
+The pipeline can be run as a **single combined call** or split into two independent phases:
+
+| Phase | Function | What it does |
+|---|---|---|
+| 1 | `prepare_batch` | SMILES → 3D coordinates → `.mop` files |
+| 2 | `run_mopac_batch` | Scans a directory for `.mop` files and submits each to MOPAC |
+| Combined | `run_pipeline` | Equivalent to calling both phases in sequence |
+
 ---
 
 ## Requirements
@@ -39,16 +47,47 @@ Copy `mopac_batch_runner.py` into your project directory. No package installatio
 
 ## Quick start
 
+### Two-phase workflow (recommended)
+
 ```python
 import pandas as pd
-from mopac_batch_runner import run_mopac_batch
+from mopac_batch_runner import prepare_batch, run_mopac_batch
 
 df = pd.DataFrame({
     "compound_id": ["ethanol", "benzene", "aspirin"],
     "smiles":      ["CCO",     "c1ccccc1", "CC(=O)Oc1ccccc1C(=O)O"],
 })
 
+# Phase 1: generate 3D structures and write .mop files.
+prep = prepare_batch(
+    df=df,
+    smiles_col="smiles",
+    id_col="compound_id",
+    keywords="PM7 PRECISE GEO-OK",
+    workdir="mopac_jobs",
+    overwrite=True,
+)
+
+print(prep[["compound_id", "status", "duration_s"]])
+
+# (Optional) inspect or edit .mop files here before running MOPAC.
+
+# Phase 2: run MOPAC on every .mop file found in the workdir.
 results = run_mopac_batch(
+    workdir="mopac_jobs",
+    overwrite=True,
+    timeout=900,
+)
+
+print(results[["compound_id", "status", "duration_s"]])
+```
+
+### Combined single-call workflow
+
+```python
+from mopac_batch_runner import run_pipeline
+
+results = run_pipeline(
     df=df,
     smiles_col="smiles",
     id_col="compound_id",
@@ -71,10 +110,95 @@ py mopac_batch_runner.py
 
 ## Function reference
 
+### `prepare_batch`
+
+```python
+prepare_batch(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: str | None = None,
+    keywords: str = "PM7 PRECISE GEO-OK",
+    workdir: str | Path = "mopac_jobs",
+    charge_col: str | None = None,
+    multiplicity_col: str | None = None,
+    overwrite: bool = False,
+    obabel_options: list[str] | None = None,
+    obabel_timeout: int = 120,
+    max_workers: int = 1,
+) -> pd.DataFrame
+```
+
+Converts SMILES strings to 3D XYZ coordinates (via Open Babel) and writes a MOPAC `.mop` input file for each compound. No MOPAC calculations are performed.
+
+**Returns**
+
+A `DataFrame` with one row per input molecule, saved to `<workdir>/prepare_results.csv`:
+
+| Column | Description |
+|---|---|
+| `compound_id` | Sanitised filesystem identifier. |
+| `smiles` | Original SMILES string. |
+| `status` | `ready`, `failed`, or `skipped`. |
+| `mop_file` | Absolute path to the `.mop` file, or `None`. |
+| `error_message` | Human-readable error description, or `None` on success. |
+| `duration_s` | Wall-clock time for the Open Babel step. |
+
+**Raises**
+
+- `EnvironmentError` — if `obabel` is not found in PATH.
+- `KeyError` — if a referenced column is absent from `df`.
+
+---
+
 ### `run_mopac_batch`
 
 ```python
 run_mopac_batch(
+    workdir: str | Path,
+    overwrite: bool = False,
+    timeout: int | None = 600,
+    max_workers: int = 1,
+) -> pd.DataFrame
+```
+
+Scans `<workdir>/*/*.mop` for prepared input files and submits each to MOPAC. The compound identifier and original SMILES are read directly from the `.mop` header — no DataFrame is required.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `workdir` | `str \| Path` | — | Root directory previously used for `prepare_batch`. All `<id>/<id>.mop` files beneath it are discovered automatically. |
+| `overwrite` | `bool` | `False` | Re-run even when a `.out` file already exists. |
+| `timeout` | `int \| None` | `600` | Per-compound MOPAC timeout in seconds. `None` = no limit. |
+| `max_workers` | `int` | `1` | Number of parallel worker threads. |
+
+**Returns**
+
+A `DataFrame` with one row per `.mop` file found, saved to `<workdir>/batch_results.csv`:
+
+| Column | Description |
+|---|---|
+| `compound_id` | Identifier read from the `.mop` file stem. |
+| `smiles` | Original SMILES extracted from the `.mop` header. |
+| `status` | `success`, `failed`, `skipped`, or `timeout`. |
+| `mop_file` | Absolute path to the `.mop` input file. |
+| `out_file` | Absolute path to the `.out` output file, or `None`. |
+| `arc_file` | Absolute path to the `.arc` archive file, or `None`. |
+| `error_message` | Human-readable error description, or `None` on success. |
+| `return_code` | MOPAC process exit code, or `None` if MOPAC never ran. |
+| `duration_s` | Wall-clock time for the MOPAC step. |
+
+**Raises**
+
+- `EnvironmentError` — if `mopac` is not found in PATH.
+- `FileNotFoundError` — if `workdir` does not exist.
+
+---
+
+### `run_pipeline`
+
+```python
+run_pipeline(
     df: pd.DataFrame,
     smiles_col: str,
     id_col: str | None = None,
@@ -90,40 +214,11 @@ run_mopac_batch(
 ) -> pd.DataFrame
 ```
 
-**Parameters**
+Runs both phases (Open Babel + MOPAC) in a single call. Equivalent to `prepare_batch` followed by `run_mopac_batch`. Use this when you do not need to inspect or edit `.mop` files between phases.
 
-| Parameter | Type | Default | Description |
-|---|---|---|---|
-| `df` | `DataFrame` | — | Input table. Must contain `smiles_col`. |
-| `smiles_col` | `str` | — | Column name holding SMILES strings. |
-| `id_col` | `str \| None` | `None` | Column to use as compound identifiers. When omitted, sequential IDs `mol_000001`, `mol_000002`, … are generated. |
-| `keywords` | `str` | `"PM7 PRECISE GEO-OK"` | MOPAC keyword line written as line 1 of every `.mop` file. |
-| `workdir` | `str \| Path` | `"mopac_jobs"` | Root output directory. Created if it does not exist. |
-| `charge_col` | `str \| None` | `None` | Column with formal integer charges. `CHARGE=n` is appended to keywords for non-zero values. |
-| `multiplicity_col` | `str \| None` | `None` | Column with spin multiplicities (2S+1). Appropriate MOPAC spin keyword is appended automatically. |
-| `overwrite` | `bool` | `False` | Re-run even when a `.out` file already exists. |
-| `timeout` | `int \| None` | `600` | Per-compound MOPAC timeout in seconds. `None` = no limit. |
-| `obabel_options` | `list[str] \| None` | `["--gen3d"]` | Primary CLI flags forwarded to `obabel`. Automatic fallbacks are tried on failure — see [3D generation fallback](#3d-generation-fallback). |
-| `obabel_timeout` | `int` | `120` | Per-compound timeout for Open Babel in seconds. |
-| `max_workers` | `int` | `1` | Number of parallel worker threads. `1` = sequential. See [Parallel execution](#parallel-execution). |
+**Parameters** — same as `prepare_batch`, with the addition of `timeout` (MOPAC per-compound limit).
 
-**Returns**
-
-A `DataFrame` with one row per input molecule, in the same order as the input:
-
-| Column | Description |
-|---|---|
-| `compound_id` | Sanitised filesystem identifier used for the job directory. |
-| `smiles` | Original SMILES string. |
-| `status` | `success`, `failed`, `skipped`, or `timeout`. |
-| `mop_file` | Absolute path to the `.mop` input file, or `None`. |
-| `out_file` | Absolute path to the `.out` output file, or `None`. |
-| `arc_file` | Absolute path to the `.arc` archive file, or `None`. |
-| `error_message` | Human-readable error description, or `None` on success. |
-| `return_code` | MOPAC process exit code, or `None` if MOPAC never ran. |
-| `duration_s` | Wall-clock time in seconds from SMILES file write to MOPAC exit. |
-
-The same table is also saved as `<workdir>/batch_results.csv`.
+**Returns** — same schema as `run_mopac_batch`, saved to `<workdir>/batch_results.csv`.
 
 **Raises**
 
@@ -148,7 +243,8 @@ mopac_jobs/
     ...
   aspirin/
     ...
-  batch_results.csv    # Summary table for the entire batch
+  prepare_results.csv  # Summary table from prepare_batch
+  batch_results.csv    # Summary table from run_mopac_batch / run_pipeline
 ```
 
 ---
@@ -202,7 +298,7 @@ df = pd.DataFrame({
     "multiplicity": [1,            3],   # triplet O2
 })
 
-results = run_mopac_batch(
+prep = prepare_batch(
     df=df,
     smiles_col="smiles",
     id_col="id",
@@ -210,6 +306,8 @@ results = run_mopac_batch(
     charge_col="charge",
     multiplicity_col="multiplicity",
 )
+
+results = run_mopac_batch(workdir="mopac_jobs")
 ```
 
 The generated keywords line for phenolate will be `PM7 PRECISE CHARGE=-1`.  
@@ -230,16 +328,29 @@ Supported multiplicities and their MOPAC keywords:
 
 ## Skipping already-completed jobs
 
-By default (`overwrite=False`) any compound whose `.out` file already exists is skipped with `status = "skipped"`. This makes it safe to resume an interrupted batch:
+Each phase has its own skip logic, both controlled by `overwrite`.
+
+| Phase | Skipped when | `overwrite=True` forces |
+|---|---|---|
+| `prepare_batch` | `.mop` file already exists | Re-run Open Babel and rewrite `.mop` |
+| `run_mopac_batch` | `.out` file already exists | Re-run MOPAC |
+| `run_pipeline` | `.out` file already exists | Re-run both Open Babel and MOPAC |
+
+This makes it safe to resume an interrupted batch:
 
 ```python
-results = run_mopac_batch(df=df, smiles_col="smiles", overwrite=False)
+# Resume preparation — skips compounds whose .mop already exists.
+prep = prepare_batch(df=df, smiles_col="smiles", overwrite=False)
+
+# Resume MOPAC — skips compounds whose .out already exists.
+results = run_mopac_batch(workdir="mopac_jobs", overwrite=False)
 ```
 
-To force recomputation of everything:
+To force full recomputation:
 
 ```python
-results = run_mopac_batch(df=df, smiles_col="smiles", overwrite=True)
+prep = prepare_batch(df=df, smiles_col="smiles", overwrite=True)
+results = run_mopac_batch(workdir="mopac_jobs", overwrite=True)
 ```
 
 ---
@@ -256,7 +367,12 @@ The script handles this automatically with a three-attempt retry chain:
 | 2 | `--gen3d dist` | Pure distance-geometry algorithm — bypasses the fragment database entirely. Used when attempt 1 crashes or produces extreme coordinates. |
 | 3 | `--gen3d dist --minimize --ff UFF --steps 500` | Distance geometry followed by UFF force-field relaxation. Used when attempt 2 produces a valid but poorly optimised geometry. |
 
-Each attempt also validates the resulting coordinates: any atom with `|x|`, `|y|`, or `|z|` > 10⁶ Å (caused by XYZ column-width overflow in Open Babel) triggers the next fallback. The log reports which attempt succeeded:
+Each attempt also validates the resulting coordinates:
+
+- Any atom with `|x|`, `|y|`, or `|z|` > 10⁶ Å (caused by XYZ column-width overflow in Open Babel) triggers the next fallback.
+- Any two atoms closer than 0.1 Å (a duplicate-position artefact from the fragment database) also trigger the next fallback. This prevents MOPAC from aborting with `ATOMS N AND M ARE SEPARATED BY 0.0000 ANGSTROMS`.
+
+The log reports which attempt succeeded:
 
 ```
 [100280-10-2] 3D generation succeeded on attempt 2 (options: ['--gen3d', 'dist']).
@@ -265,7 +381,7 @@ Each attempt also validates the resulting coordinates: any atom with `|x|`, `|y|
 To override the primary options while still keeping the automatic fallbacks:
 
 ```python
-results = run_mopac_batch(
+prep = prepare_batch(
     df=df,
     smiles_col="smiles",
     obabel_options=["--gen3d", "--minimize", "--ff", "MMFF94", "--steps", "300"],
@@ -278,15 +394,20 @@ To change the fallback chain globally, edit `OBABEL_FALLBACK_OPTIONS` at the top
 
 ## Parallel execution
 
-Set `max_workers` to run multiple MOPAC jobs simultaneously.  Each job writes to its own subdirectory so there are no filesystem conflicts.  The returned DataFrame always preserves the input row order regardless of completion order.
+Both `prepare_batch` and `run_mopac_batch` accept a `max_workers` parameter to run jobs simultaneously. Each job writes to its own subdirectory so there are no filesystem conflicts. The returned DataFrame always preserves the input row order (for `prepare_batch`) or file-discovery order (for `run_mopac_batch`) regardless of completion order.
 
 ```python
-# 4 jobs running at the same time
-results = run_mopac_batch(
+# 4 preparation workers, then 4 MOPAC workers.
+prep = prepare_batch(
     df=df,
     smiles_col="smiles",
     id_col="compound_id",
     keywords="PM7 PRECISE GEO-OK",
+    workdir="mopac_jobs",
+    max_workers=4,
+)
+
+results = run_mopac_batch(
     workdir="mopac_jobs",
     max_workers=4,
     timeout=600,
@@ -298,23 +419,22 @@ results = run_mopac_batch(
 - A value of **4–8** is a practical starting point on a modern workstation.
 - Keep it at or below the number of **physical CPU cores** — each MOPAC process is CPU-bound and spawning more workers than cores increases wall time rather than reducing it.
 - Memory scales linearly: a typical PM7 optimisation uses 50–200 MB; multiply by `max_workers` to estimate peak RAM.
-- `max_workers=1` (the default) is identical to the previous sequential behaviour.
+- `max_workers=1` (the default) is identical to sequential behaviour.
 
 **Progress logging** differs slightly between modes.  Sequential mode logs before each job starts:
 
 ```
 [1/5] ethanol
-[ethanol] Running MOPAC ...
-[ethanol] Done in 0.20s.
+[ethanol] Prepared in 0.18s.
 ```
 
 Parallel mode logs after each job completes (order reflects completion, not input order):
 
 ```
-Parallel batch: 5 jobs across 3 workers.
-[1/5] benzene — success
-[2/5] ethanol — success
-[3/5] aspirin — success
+Parallel prepare: 5 jobs across 3 workers.
+[1/5] benzene — ready
+[2/5] ethanol — ready
+[3/5] aspirin — ready
 ```
 
 ---
@@ -326,6 +446,11 @@ import pandas as pd
 import re
 from pathlib import Path
 
+# Preparation results (phase 1).
+prep = pd.read_csv("mopac_jobs/prepare_results.csv")
+print(prep[prep["status"] != "ready"])  # show any failures
+
+# MOPAC results (phase 2).
 results = pd.read_csv("mopac_jobs/batch_results.csv")
 
 def heat_of_formation(out_path):
@@ -368,4 +493,5 @@ Set `level=logging.DEBUG` to see every subprocess command that is executed, incl
 
 - **Windows only** — tested on Windows 11 with MOPAC 23.2.1 and Open Babel 3.1.1. The code uses `pathlib` and list-based `subprocess` calls so it should be portable, but is untested on Linux/macOS.
 - **MOPAC keyword line length** — MOPAC has an 80-character limit per keyword line. Long auto-generated keyword strings (charge + high spin multiplicity) may need manual splitting.
-- **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `batch_results.csv` to see which attempt failed and why.
+- **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `prepare_results.csv` to see which attempt failed and why.
+- **`run_mopac_batch` discovers `.mop` files alphabetically** — the row order in `batch_results.csv` reflects filesystem sort order, not the original DataFrame order. Join on `compound_id` if you need to align with the input.
