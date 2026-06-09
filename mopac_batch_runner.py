@@ -39,6 +39,7 @@ import re
 import shutil
 import subprocess
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -58,6 +59,33 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 OBABEL_DEFAULT_OPTIONS: list[str] = ["--gen3d"]
+
+# Fallback option sets tried in order when the primary obabel call produces a
+# crash, NaN coordinates, or an XYZ file with overflowed column values.
+#
+# Rationale for each fallback:
+#   1. "--gen3d dist" — pure distance-geometry algorithm; does NOT look up
+#      fragment coordinates from rigid-fragments.txt, which is the root cause
+#      of the "all zero coordinates" segfault in Open Babel 3.1.1.
+#      ("fast", "rough", and "best" all share the same fragment-lookup code
+#      path and crash identically on missing fragments.)
+#   2. "--gen3d dist" + UFF minimisation — distance geometry followed by a
+#      force-field relaxation to clean up NaN/extreme values.
+OBABEL_FALLBACK_OPTIONS: list[list[str]] = [
+    ["--gen3d", "dist"],
+    ["--gen3d", "dist", "--minimize", "--ff", "UFF", "--steps", "500"],
+]
+
+# Coordinates whose absolute value exceeds this threshold (Å) are physically
+# impossible and indicate a 3D-generation artefact (XYZ column overflow, etc.).
+_MAX_COORD_ABS: float = 1e6
+
+# Minimum allowed distance between any two atoms (Å).  Open Babel occasionally
+# places two atoms at identical positions (a 3D-generation bug triggered by
+# certain ring fluorine patterns).  Atoms closer than this threshold are
+# flagged so the fallback obabel options are tried instead of passing a broken
+# geometry to MOPAC.
+_MIN_ATOM_DIST: float = 0.1
 
 # ---------------------------------------------------------------------------
 # Spin-multiplicity → MOPAC keyword mapping.
@@ -423,6 +451,56 @@ def parse_xyz(xyz_file: Path) -> list[XYZAtom]:
     return atoms
 
 
+def _validate_atom_coords(atoms: list[XYZAtom]) -> Optional[str]:
+    """Return an error string if any coordinate is physically unreasonable.
+
+    Detects three classes of Open Babel 3D-generation artefacts:
+
+    * **Column overflow** — when a float is too wide for the XYZ fixed-width
+      field, adjacent numbers merge into one token.  After splitting on
+      whitespace the merged token parses to an astronomically large float.
+    * **NaN / Inf** — non-finite values produced during force-field building.
+    * **Duplicate positions** — two atoms placed at the same point in space
+      (distance < ``_MIN_ATOM_DIST``).  Occurs with certain fluorinated-ring
+      SMILES when the fragment-database lookup produces overlapping coordinates.
+      MOPAC will report "ATOMS N AND M ARE SEPARATED BY 0.0000 ANGSTROMS" and
+      abort without producing a ``.arc`` file, even when ``GEO-OK`` is set.
+
+    Args:
+        atoms: Parsed atom list from :func:`parse_xyz`.
+
+    Returns:
+        A human-readable error string, or ``None`` if all coordinates look
+        reasonable.
+    """
+    import math
+
+    for atom in atoms:
+        for label, v in (("x", atom.x), ("y", atom.y), ("z", atom.z)):
+            if not math.isfinite(v):
+                return (
+                    f"Atom {atom.element} has non-finite {label}-coordinate: {v}"
+                )
+            if abs(v) > _MAX_COORD_ABS:
+                return (
+                    f"Atom {atom.element} has extreme {label}-coordinate "
+                    f"({v:.6g} Å) — likely an XYZ column-overflow artefact."
+                )
+
+    min_dist_sq = _MIN_ATOM_DIST ** 2
+    for i, a in enumerate(atoms):
+        for j in range(i + 1, len(atoms)):
+            b = atoms[j]
+            d_sq = (a.x - b.x) ** 2 + (a.y - b.y) ** 2 + (a.z - b.z) ** 2
+            if d_sq < min_dist_sq:
+                return (
+                    f"Atoms {i + 1} ({a.element}) and {j + 1} ({b.element}) are "
+                    f"only {math.sqrt(d_sq):.4f} Å apart — likely a 3D-generation artefact."
+                )
+
+    return None
+
+
 # ---------------------------------------------------------------------------
 # MOPAC keyword builder (charge + spin multiplicity)
 # ---------------------------------------------------------------------------
@@ -635,40 +713,73 @@ def process_one_molecule(
         result.error_message = f"Cannot write SMILES file: {exc}"
         return result
 
-    # -- Step 2: generate 3D coordinates ------------------------------------
+    # -- Steps 2–3: generate 3D coordinates + parse XYZ (with fallbacks) -----
+    # Build the ordered list of option sets to try: caller-supplied first,
+    # then each entry from OBABEL_FALLBACK_OPTIONS.
+    primary = obabel_options if obabel_options is not None else list(OBABEL_DEFAULT_OPTIONS)
+    option_sets = [primary] + OBABEL_FALLBACK_OPTIONS
+
     xyz_file = job.job_dir / "structure.xyz"
-    obabel_res = generate_3d_with_obabel(
-        smi_file=smi_file,
-        xyz_file=xyz_file,
-        obabel_options=obabel_options,
-        timeout=obabel_timeout,
-    )
+    atoms: list[XYZAtom] = []
+    attempt_error = "No obabel attempt was made."
 
-    if obabel_res.timed_out:
-        result.error_message = (
-            f"Open Babel timed out after {obabel_timeout}s."
+    for attempt, opts in enumerate(option_sets, start=1):
+        logger.debug(
+            "[%s] obabel attempt %d/%d: %s",
+            job.compound_id, attempt, len(option_sets), opts,
         )
-        return result
-
-    if obabel_res.returncode != 0:
-        result.error_message = (
-            f"Open Babel failed (rc={obabel_res.returncode}). "
-            f"stderr: {obabel_res.stderr.strip()[:400]}"
+        obabel_res = generate_3d_with_obabel(
+            smi_file=smi_file,
+            xyz_file=xyz_file,
+            obabel_options=opts,
+            timeout=obabel_timeout,
         )
-        return result
 
-    if not xyz_file.exists() or xyz_file.stat().st_size == 0:
-        result.error_message = (
-            f"Open Babel returned rc=0 but {xyz_file.name} is missing or "
-            f"empty.  stderr: {obabel_res.stderr.strip()[:400]}"
-        )
-        return result
+        if obabel_res.timed_out:
+            attempt_error = f"Open Babel timed out after {obabel_timeout}s."
+            break  # timeout is not recoverable by retrying
 
-    # -- Step 3: parse XYZ --------------------------------------------------
-    try:
-        atoms = parse_xyz(xyz_file)
-    except ValueError as exc:
-        result.error_message = f"XYZ parse error: {exc}"
+        if obabel_res.returncode != 0:
+            attempt_error = (
+                f"Open Babel failed (rc={obabel_res.returncode}). "
+                f"stderr: {obabel_res.stderr.strip()[:300]}"
+            )
+            logger.debug("[%s] attempt %d failed: %s", job.compound_id, attempt, attempt_error)
+            continue
+
+        if not xyz_file.exists() or xyz_file.stat().st_size == 0:
+            attempt_error = (
+                f"Open Babel returned rc=0 but {xyz_file.name} is missing or empty. "
+                f"stderr: {obabel_res.stderr.strip()[:300]}"
+            )
+            logger.debug("[%s] attempt %d: empty XYZ.", job.compound_id, attempt)
+            continue
+
+        try:
+            parsed = parse_xyz(xyz_file)
+        except ValueError as exc:
+            attempt_error = f"XYZ parse error: {exc}"
+            logger.debug("[%s] attempt %d: %s", job.compound_id, attempt, attempt_error)
+            continue
+
+        coord_err = _validate_atom_coords(parsed)
+        if coord_err:
+            attempt_error = f"Coordinate validation failed: {coord_err}"
+            logger.debug("[%s] attempt %d: %s", job.compound_id, attempt, attempt_error)
+            continue
+
+        # This attempt succeeded.
+        atoms = parsed
+        if attempt > 1:
+            logger.info(
+                "[%s] 3D generation succeeded on attempt %d (options: %s).",
+                job.compound_id, attempt, opts,
+            )
+        attempt_error = ""
+        break
+
+    if not atoms:
+        result.error_message = attempt_error
         return result
 
     # -- Step 4: write .mop -------------------------------------------------
@@ -732,6 +843,106 @@ def process_one_molecule(
 
 
 # ---------------------------------------------------------------------------
+# Job-list builder (sequential — must not be parallelised)
+# ---------------------------------------------------------------------------
+
+
+def _build_job_list(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: Optional[str],
+    keywords: str,
+    workdir: Path,
+    charge_col: Optional[str],
+    multiplicity_col: Optional[str],
+) -> list[MoleculeJob]:
+    """Resolve every DataFrame row into a :class:`MoleculeJob`.
+
+    This step must run sequentially so that duplicate sanitised IDs are
+    detected and given unique suffixes before any worker touches the
+    filesystem.
+
+    Args:
+        df:               Input DataFrame (already column-validated).
+        smiles_col:       Column holding SMILES strings.
+        id_col:           Optional column for compound identifiers.
+        keywords:         MOPAC keyword string.
+        workdir:          Resolved absolute root directory.
+        charge_col:       Optional column for formal charges.
+        multiplicity_col: Optional column for spin multiplicities.
+
+    Returns:
+        Ordered list of :class:`MoleculeJob` objects, one per DataFrame row.
+    """
+    jobs: list[MoleculeJob] = []
+    seen_ids: dict[str, int] = {}
+
+    for enum_idx, (_, row) in enumerate(df.iterrows(), start=1):
+
+        # -- SMILES ---------------------------------------------------------
+        raw_smiles = row[smiles_col]
+        smiles = str(raw_smiles) if pd.notna(raw_smiles) else ""
+
+        # -- Charge ---------------------------------------------------------
+        charge = 0
+        if charge_col:
+            raw_charge = row[charge_col]
+            if pd.notna(raw_charge):
+                try:
+                    charge = int(raw_charge)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Row %d: cannot convert charge %r to int; using 0.",
+                        enum_idx, raw_charge,
+                    )
+
+        # -- Multiplicity ---------------------------------------------------
+        multiplicity = 1
+        if multiplicity_col:
+            raw_mult = row[multiplicity_col]
+            if pd.notna(raw_mult):
+                try:
+                    multiplicity = int(raw_mult)
+                except (ValueError, TypeError):
+                    logger.warning(
+                        "Row %d: cannot convert multiplicity %r to int; using 1.",
+                        enum_idx, raw_mult,
+                    )
+            if multiplicity < 1:
+                logger.warning(
+                    "Row %d: multiplicity %d < 1; clamping to 1.",
+                    enum_idx, multiplicity,
+                )
+                multiplicity = 1
+
+        # -- Compound ID ----------------------------------------------------
+        if id_col and pd.notna(row[id_col]):
+            raw_id = str(row[id_col])
+        else:
+            raw_id = f"mol_{enum_idx:06d}"
+
+        base_id = sanitize_id(raw_id)
+
+        if base_id in seen_ids:
+            seen_ids[base_id] += 1
+            compound_id = f"{base_id}_{seen_ids[base_id]}"
+        else:
+            seen_ids[base_id] = 0
+            compound_id = base_id
+
+        jobs.append(MoleculeJob(
+            compound_id=compound_id,
+            smiles=smiles,
+            charge=charge,
+            multiplicity=multiplicity,
+            job_dir=workdir / compound_id,
+            keywords=keywords,
+        ))
+
+    return jobs
+
+
+# ---------------------------------------------------------------------------
 # Public batch entry point
 # ---------------------------------------------------------------------------
 
@@ -748,6 +959,7 @@ def run_mopac_batch(
     timeout: Optional[int] = 600,
     obabel_options: Optional[list[str]] = None,
     obabel_timeout: int = 120,
+    max_workers: int = 1,
 ) -> pd.DataFrame:
     """Run SMILES → Open Babel → MOPAC for every row of a DataFrame.
 
@@ -756,14 +968,19 @@ def run_mopac_batch(
     1. Resolves a compound identifier from *id_col* or generates a sequential
        one (``mol_000001``, ``mol_000002``, …).
     2. Creates ``<workdir>/<compound_id>/``.
-    3. Generates a 3D structure with Open Babel (``--gen3d`` by default).
+    3. Generates a 3D structure with Open Babel (``--gen3d`` by default,
+       with automatic fallback to ``--gen3d dist`` on crashes).
     4. Writes a MOPAC Cartesian-coordinate input file.
     5. Executes MOPAC and waits up to *timeout* seconds.
     6. Records status, output paths, return code, and elapsed time.
 
-    Processing is sequential; individual failures do not abort the batch.
-    At the end the full results table is saved to
-    ``<workdir>/batch_results.csv``.
+    When *max_workers* > 1 the molecule jobs run in a
+    :class:`~concurrent.futures.ThreadPoolExecutor`.  Each job writes to its
+    own subdirectory so there are no filesystem conflicts.  ID deduplication
+    always runs sequentially before the pool is started.
+
+    Individual failures never abort the batch.  At the end the full results
+    table is saved to ``<workdir>/batch_results.csv``.
 
     Args:
         df:               Input DataFrame.  Must contain *smiles_col*.
@@ -787,11 +1004,17 @@ def run_mopac_batch(
         obabel_options:   Extra CLI flags forwarded to obabel.
                           Default: ``["--gen3d"]``.
         obabel_timeout:   Per-compound timeout for the Open Babel subprocess.
+        max_workers:      Number of parallel worker threads.  ``1`` (default)
+                          runs sequentially.  A value of ``4``–``8`` is a
+                          reasonable starting point; keep it below the number
+                          of physical CPU cores to avoid memory pressure from
+                          concurrent MOPAC processes.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``,
         ``mop_file``, ``out_file``, ``arc_file``, ``error_message``,
-        ``return_code``, ``duration_s``.
+        ``return_code``, ``duration_s``.  Row order matches the input
+        DataFrame regardless of completion order.
 
     Raises:
         EnvironmentError: If obabel or mopac is not found in PATH.
@@ -811,98 +1034,62 @@ def run_mopac_batch(
             f"Available columns: {list(df.columns)}"
         )
 
-    results: list[JobResult] = []
-    seen_ids: dict[str, int] = {}  # tracks sanitised IDs for deduplication
+    # -- Build ordered job list (sequential — deduplicates IDs) ------------
+    jobs = _build_job_list(
+        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col
+    )
+    n = len(jobs)
 
-    for enum_idx, (_, row) in enumerate(df.iterrows(), start=1):
+    # Shared kwargs forwarded to every process_one_molecule call.
+    run_kwargs = dict(
+        overwrite=overwrite,
+        obabel_timeout=obabel_timeout,
+        mopac_timeout=timeout,
+        obabel_options=obabel_options,
+    )
 
-        # -- SMILES ---------------------------------------------------------
-        raw_smiles = row[smiles_col]
-        smiles = str(raw_smiles) if pd.notna(raw_smiles) else ""
+    # -- Execute jobs -------------------------------------------------------
+    results: list[Optional[JobResult]] = [None] * n
 
-        # -- Charge ---------------------------------------------------------
-        charge = 0
-        if charge_col:
-            raw_charge = row[charge_col]
-            if pd.notna(raw_charge):
-                try:
-                    charge = int(raw_charge)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Row %d: cannot convert charge %r to int; using 0.",
-                        enum_idx,
-                        raw_charge,
-                    )
-
-        # -- Multiplicity ---------------------------------------------------
-        multiplicity = 1
-        if multiplicity_col:
-            raw_mult = row[multiplicity_col]
-            if pd.notna(raw_mult):
-                try:
-                    multiplicity = int(raw_mult)
-                except (ValueError, TypeError):
-                    logger.warning(
-                        "Row %d: cannot convert multiplicity %r to int; "
-                        "using 1.",
-                        enum_idx,
-                        raw_mult,
-                    )
-            if multiplicity < 1:
-                logger.warning(
-                    "Row %d: multiplicity %d < 1; clamping to 1.",
-                    enum_idx,
-                    multiplicity,
+    if max_workers == 1:
+        for idx, job in enumerate(jobs):
+            logger.info("[%d/%d] %s", idx + 1, n, job.compound_id)
+            try:
+                results[idx] = process_one_molecule(job=job, **run_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[%s] Unexpected exception: %s", job.compound_id, exc)
+                results[idx] = JobResult(
+                    compound_id=job.compound_id, smiles=job.smiles,
+                    status="failed", error_message=f"Unexpected exception: {exc}",
                 )
-                multiplicity = 1
-
-        # -- Compound ID ----------------------------------------------------
-        if id_col and pd.notna(row[id_col]):
-            raw_id = str(row[id_col])
-        else:
-            raw_id = f"mol_{enum_idx:06d}"
-
-        base_id = sanitize_id(raw_id)
-
-        # Deduplicate IDs that sanitise to the same string.
-        if base_id in seen_ids:
-            seen_ids[base_id] += 1
-            compound_id = f"{base_id}_{seen_ids[base_id]}"
-        else:
-            seen_ids[base_id] = 0
-            compound_id = base_id
-
-        logger.info("[%d/%d] %s", enum_idx, len(df), compound_id)
-
-        job = MoleculeJob(
-            compound_id=compound_id,
-            smiles=smiles,
-            charge=charge,
-            multiplicity=multiplicity,
-            job_dir=workdir / compound_id,
-            keywords=keywords,
-        )
-
-        try:
-            result = process_one_molecule(
-                job=job,
-                overwrite=overwrite,
-                obabel_timeout=obabel_timeout,
-                mopac_timeout=timeout,
-                obabel_options=obabel_options,
-            )
-        except Exception as exc:  # pylint: disable=broad-except
-            logger.exception(
-                "[%s] Unexpected exception: %s", compound_id, exc
-            )
-            result = JobResult(
-                compound_id=compound_id,
-                smiles=smiles,
-                status="failed",
-                error_message=f"Unexpected exception: {exc}",
-            )
-
-        results.append(result)
+    else:
+        logger.info("Parallel batch: %d jobs across %d workers.", n, max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {
+                pool.submit(process_one_molecule, job=job, **run_kwargs): idx
+                for idx, job in enumerate(jobs)
+            }
+            completed = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                completed += 1
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        "[%s] Unexpected exception: %s",
+                        jobs[idx].compound_id, exc,
+                    )
+                    results[idx] = JobResult(
+                        compound_id=jobs[idx].compound_id,
+                        smiles=jobs[idx].smiles,
+                        status="failed",
+                        error_message=f"Unexpected exception: {exc}",
+                    )
+                logger.info(
+                    "[%d/%d] %s — %s",
+                    completed, n, results[idx].compound_id, results[idx].status,
+                )
 
     # -- Build results DataFrame --------------------------------------------
     if results:
@@ -910,23 +1097,15 @@ def run_mopac_batch(
     else:
         results_df = pd.DataFrame(
             columns=[
-                "compound_id",
-                "smiles",
-                "status",
-                "mop_file",
-                "out_file",
-                "arc_file",
-                "error_message",
-                "return_code",
-                "duration_s",
+                "compound_id", "smiles", "status",
+                "mop_file", "out_file", "arc_file",
+                "error_message", "return_code", "duration_s",
             ]
         )
 
     csv_path = workdir / "batch_results.csv"
     results_df.to_csv(csv_path, index=False)
-    logger.info(
-        "Batch finished — %d compound(s).  Results → %s", len(results), csv_path
-    )
+    logger.info("Batch finished — %d compound(s).  Results → %s", n, csv_path)
 
     return results_df
 

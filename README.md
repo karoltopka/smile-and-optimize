@@ -86,6 +86,7 @@ run_mopac_batch(
     timeout: int | None = 600,
     obabel_options: list[str] | None = None,
     obabel_timeout: int = 120,
+    max_workers: int = 1,
 ) -> pd.DataFrame
 ```
 
@@ -102,12 +103,13 @@ run_mopac_batch(
 | `multiplicity_col` | `str \| None` | `None` | Column with spin multiplicities (2S+1). Appropriate MOPAC spin keyword is appended automatically. |
 | `overwrite` | `bool` | `False` | Re-run even when a `.out` file already exists. |
 | `timeout` | `int \| None` | `600` | Per-compound MOPAC timeout in seconds. `None` = no limit. |
-| `obabel_options` | `list[str] \| None` | `["--gen3d"]` | Extra CLI flags forwarded to `obabel`. |
+| `obabel_options` | `list[str] \| None` | `["--gen3d"]` | Primary CLI flags forwarded to `obabel`. Automatic fallbacks are tried on failure — see [3D generation fallback](#3d-generation-fallback). |
 | `obabel_timeout` | `int` | `120` | Per-compound timeout for Open Babel in seconds. |
+| `max_workers` | `int` | `1` | Number of parallel worker threads. `1` = sequential. See [Parallel execution](#parallel-execution). |
 
 **Returns**
 
-A `DataFrame` with one row per input molecule:
+A `DataFrame` with one row per input molecule, in the same order as the input:
 
 | Column | Description |
 |---|---|
@@ -140,7 +142,7 @@ mopac_jobs/
     ethanol.mop        # MOPAC input file
     ethanol.out        # MOPAC output (energies, geometry, etc.)
     ethanol.arc        # MOPAC archive / optimised geometry
-    obabel.log         # Full obabel stdout + stderr
+    obabel.log         # Full obabel stdout + stderr (last attempt)
     mopac_process.log  # Full mopac stdout + stderr
   benzene/
     ...
@@ -166,7 +168,7 @@ O      3.08132000  1    -0.41155000  1     1.21850000  1
 
 - **Line 1** — MOPAC keywords.
 - **Line 2** — Compound title (identifier + SMILES for traceability).
-- **Line 3** — Blank (required separator).
+- **Line 3** — Blank (required separator; a third header line here causes MOPAC to silently skip the calculation).
 - **Lines 4+** — Atom coordinates with optimisation flag `1` per coordinate.
 
 > The optimisation flag `1` means "optimise this degree of freedom". Change it to `0` in the source to freeze a coordinate.
@@ -242,6 +244,81 @@ results = run_mopac_batch(df=df, smiles_col="smiles", overwrite=True)
 
 ---
 
+## 3D generation fallback
+
+Open Babel 3.1.1 contains a bug where the default `--gen3d` algorithm (`best`) looks up fragment coordinates from `rigid-fragments.txt` and **segfaults** when a fragment is absent from the database. Common triggers include fluoroanilines, fluoropyrimidines, chloroanilines, and certain aliphatic fluorinated rings.
+
+The script handles this automatically with a three-attempt retry chain:
+
+| Attempt | Options used | Notes |
+|---|---|---|
+| 1 | `--gen3d` *(or caller-supplied `obabel_options`)* | Default; fastest and most accurate when it works. |
+| 2 | `--gen3d dist` | Pure distance-geometry algorithm — bypasses the fragment database entirely. Used when attempt 1 crashes or produces extreme coordinates. |
+| 3 | `--gen3d dist --minimize --ff UFF --steps 500` | Distance geometry followed by UFF force-field relaxation. Used when attempt 2 produces a valid but poorly optimised geometry. |
+
+Each attempt also validates the resulting coordinates: any atom with `|x|`, `|y|`, or `|z|` > 10⁶ Å (caused by XYZ column-width overflow in Open Babel) triggers the next fallback. The log reports which attempt succeeded:
+
+```
+[100280-10-2] 3D generation succeeded on attempt 2 (options: ['--gen3d', 'dist']).
+```
+
+To override the primary options while still keeping the automatic fallbacks:
+
+```python
+results = run_mopac_batch(
+    df=df,
+    smiles_col="smiles",
+    obabel_options=["--gen3d", "--minimize", "--ff", "MMFF94", "--steps", "300"],
+)
+```
+
+To change the fallback chain globally, edit `OBABEL_FALLBACK_OPTIONS` at the top of the module.
+
+---
+
+## Parallel execution
+
+Set `max_workers` to run multiple MOPAC jobs simultaneously.  Each job writes to its own subdirectory so there are no filesystem conflicts.  The returned DataFrame always preserves the input row order regardless of completion order.
+
+```python
+# 4 jobs running at the same time
+results = run_mopac_batch(
+    df=df,
+    smiles_col="smiles",
+    id_col="compound_id",
+    keywords="PM7 PRECISE GEO-OK",
+    workdir="mopac_jobs",
+    max_workers=4,
+    timeout=600,
+)
+```
+
+**Choosing `max_workers`**
+
+- A value of **4–8** is a practical starting point on a modern workstation.
+- Keep it at or below the number of **physical CPU cores** — each MOPAC process is CPU-bound and spawning more workers than cores increases wall time rather than reducing it.
+- Memory scales linearly: a typical PM7 optimisation uses 50–200 MB; multiply by `max_workers` to estimate peak RAM.
+- `max_workers=1` (the default) is identical to the previous sequential behaviour.
+
+**Progress logging** differs slightly between modes.  Sequential mode logs before each job starts:
+
+```
+[1/5] ethanol
+[ethanol] Running MOPAC ...
+[ethanol] Done in 0.20s.
+```
+
+Parallel mode logs after each job completes (order reflects completion, not input order):
+
+```
+Parallel batch: 5 jobs across 3 workers.
+[1/5] benzene — success
+[2/5] ethanol — success
+[3/5] aspirin — success
+```
+
+---
+
 ## Reading results after the batch
 
 ```python
@@ -271,28 +348,6 @@ obabel aspirin.arc -oxyz -O aspirin_opt.xyz
 
 ---
 
-## Adjusting 3D generation options
-
-The default `obabel` call is:
-
-```
-obabel -ismi input.smi -oxyz -O structure.xyz --gen3d
-```
-
-To add a force-field minimisation step after 3D embedding:
-
-```python
-results = run_mopac_batch(
-    df=df,
-    smiles_col="smiles",
-    obabel_options=["--gen3d", "--minimize", "--ff", "MMFF94", "--steps", "500"],
-)
-```
-
-To change the default globally, edit `OBABEL_DEFAULT_OPTIONS` at the top of the module.
-
----
-
 ## Logging
 
 The module uses Python's standard `logging` module under the logger name `mopac_batch_runner`. Enable it in your script:
@@ -305,12 +360,12 @@ logging.basicConfig(
 )
 ```
 
-Set `level=logging.DEBUG` to see every subprocess command that is executed.
+Set `level=logging.DEBUG` to see every subprocess command that is executed, including which obabel fallback attempt is being tried.
 
 ---
 
 ## Known limitations
 
-- **Sequential execution** — one MOPAC job runs at a time. For parallel batches see the parallel execution section in the source module's docstring.
 - **Windows only** — tested on Windows 11 with MOPAC 23.2.1 and Open Babel 3.1.1. The code uses `pathlib` and list-based `subprocess` calls so it should be portable, but is untested on Linux/macOS.
-- **MOPAC keyword line length** — MOPAC has an 80-character limit per keyword line. Long auto-generated keyword strings (many charges/spin tokens) may need manual splitting.
+- **MOPAC keyword line length** — MOPAC has an 80-character limit per keyword line. Long auto-generated keyword strings (charge + high spin multiplicity) may need manual splitting.
+- **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `batch_results.csv` to see which attempt failed and why.
