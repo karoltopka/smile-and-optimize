@@ -2,13 +2,14 @@
 
 Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**.
 
-The pipeline can be run as a **single combined call** or split into two independent phases:
+The pipeline can be run as a **single combined call** or split into three independent phases:
 
 | Phase | Function | What it does |
 |---|---|---|
 | 1 | `prepare_batch` | SMILES → 3D coordinates → `.mop` files |
 | 2 | `run_mopac_batch` | Scans a directory for `.mop` files and submits each to MOPAC |
-| Combined | `run_pipeline` | Equivalent to calling both phases in sequence |
+| 3 | `export_sdf` | Converts optimised `.arc` files to `.sdf` via Open Babel |
+| Combined | `run_pipeline` | Phases 1 + 2 in a single call (SDF export always runs separately) |
 
 ---
 
@@ -47,11 +48,11 @@ Copy `mopac_batch_runner.py` into your project directory. No package installatio
 
 ## Quick start
 
-### Two-phase workflow (recommended)
+### Three-phase workflow (recommended)
 
 ```python
 import pandas as pd
-from mopac_batch_runner import prepare_batch, run_mopac_batch
+from mopac_batch_runner import prepare_batch, run_mopac_batch, export_sdf
 
 df = pd.DataFrame({
     "compound_id": ["ethanol", "benzene", "aspirin"],
@@ -80,6 +81,11 @@ results = run_mopac_batch(
 )
 
 print(results[["compound_id", "status", "duration_s"]])
+
+# Phase 3: export optimised geometries to SDF.
+sdf = export_sdf(workdir="mopac_jobs", overwrite=True)
+
+print(sdf[["compound_id", "status", "sdf_file"]])
 ```
 
 ### Combined single-call workflow
@@ -237,6 +243,50 @@ Runs both phases (Open Babel + MOPAC) in a single call. Equivalent to `prepare_b
 
 ---
 
+### `export_sdf`
+
+```python
+export_sdf(
+    workdir: str | Path,
+    overwrite: bool = False,
+    timeout: int = 60,
+    max_workers: int = 1,
+) -> pd.DataFrame
+```
+
+Phase 3: converts optimised MOPAC `.arc` files to `.sdf` format using Open Babel. Scans `<workdir>/*/*.arc` — only compounds that completed a successful MOPAC optimisation (i.e. have an `.arc` file) are processed. Compounds whose MOPAC run failed are automatically excluded.
+
+The geometry used is extracted from the `FINAL GEOMETRY OBTAINED` block at the end of each `.arc` file, which contains the fully converged Cartesian coordinates. Open Babel reads this block using the MOPAC Cartesian input format (`-imop`) rather than the `.arc` extension, which produces incorrect output in Open Babel 3.1.1.
+
+**Parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `workdir` | `str \| Path` | — | Root directory used for the previous pipeline phases. |
+| `overwrite` | `bool` | `False` | Re-convert even when a `.sdf` file already exists. |
+| `timeout` | `int` | `60` | Per-compound obabel timeout in seconds. |
+| `max_workers` | `int` | `1` | Number of parallel worker threads. |
+
+**Returns**
+
+A `DataFrame` with one row per `.arc` file found, saved to `<workdir>/sdf_results.csv`:
+
+| Column | Description |
+|---|---|
+| `compound_id` | Identifier from the `.arc` file stem. |
+| `arc_file` | Absolute path to the source `.arc` file. |
+| `sdf_file` | Absolute path to the produced `.sdf` file, or `None`. |
+| `status` | `success`, `failed`, or `skipped`. |
+| `error_message` | Human-readable error description, or `None` on success. |
+| `duration_s` | Wall-clock time for the Open Babel conversion. |
+
+**Raises**
+
+- `EnvironmentError` — if `obabel` is not found in PATH.
+- `FileNotFoundError` — if `workdir` does not exist.
+
+---
+
 ## Output directory structure
 
 ```
@@ -247,7 +297,9 @@ mopac_jobs/
     ethanol.mop        # MOPAC input file
     ethanol.out        # MOPAC output (energies, geometry, etc.)
     ethanol.arc        # MOPAC archive / optimised geometry
-    obabel.log         # Full obabel stdout + stderr (last attempt)
+    ethanol.sdf        # Optimised structure in SDF format (from export_sdf)
+    obabel.log         # obabel stdout + stderr for 3D generation (last attempt)
+    obabel_sdf.log     # obabel stdout + stderr for SDF conversion
     mopac_process.log  # Full mopac stdout + stderr
   benzene/
     ...
@@ -255,6 +307,7 @@ mopac_jobs/
     ...
   prepare_results.csv  # Summary table from prepare_batch
   batch_results.csv    # Summary table from run_mopac_batch / run_pipeline
+  sdf_results.csv      # Summary table from export_sdf
 ```
 
 ---

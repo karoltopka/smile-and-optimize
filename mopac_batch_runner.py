@@ -204,6 +204,29 @@ class PrepResult:
 
 
 @dataclass
+class SdfResult:
+    """Outcome of phase 3: .arc → .sdf conversion via Open Babel."""
+
+    compound_id: str
+    arc_file: Optional[Path] = None
+    sdf_file: Optional[Path] = None
+    status: str = "failed"  # success | failed | skipped | no_arc
+    error_message: Optional[str] = None
+    duration: Optional[float] = None
+
+    def to_dict(self) -> dict:
+        """Serialise to a flat dict suitable for a pandas DataFrame row."""
+        return {
+            "compound_id": self.compound_id,
+            "arc_file": str(self.arc_file) if self.arc_file else None,
+            "sdf_file": str(self.sdf_file) if self.sdf_file else None,
+            "status": self.status,
+            "error_message": self.error_message,
+            "duration_s": round(self.duration, 3) if self.duration is not None else None,
+        }
+
+
+@dataclass
 class CommandResult:
     """Result of a subprocess call."""
 
@@ -694,6 +717,112 @@ def run_mopac(
         timeout=timeout,
         log_file=mop_file.parent / "mopac_process.log",
     )
+
+
+# ---------------------------------------------------------------------------
+# Phase 3: convert optimised .arc files to .sdf via Open Babel
+# ---------------------------------------------------------------------------
+
+
+def _extract_final_geometry(arc_file: Path) -> Optional[str]:
+    """Return the MOPAC Cartesian block after 'FINAL GEOMETRY OBTAINED'.
+
+    The tail of a ``.arc`` file is valid MOPAC Cartesian input (same format
+    as ``.mop``).  Open Babel reads it correctly when the input format is
+    specified as ``-imop``.
+
+    Returns:
+        The geometry block as a string, or ``None`` if the marker is absent
+        (e.g. the optimisation did not converge).
+    """
+    text = arc_file.read_text(encoding="utf-8", errors="replace")
+    marker = "FINAL GEOMETRY OBTAINED"
+    idx = text.find(marker)
+    if idx == -1:
+        return None
+    return text[idx + len(marker):].lstrip("\n")
+
+
+def _convert_arc_to_sdf(
+    arc_file: Path,
+    sdf_file: Path,
+    timeout: int = 60,
+    overwrite: bool = False,
+) -> SdfResult:
+    """Convert a single MOPAC ``.arc`` file to ``.sdf`` using obabel.
+
+    The optimised geometry is extracted from the ``FINAL GEOMETRY OBTAINED``
+    block of the ``.arc`` file and written to a temporary ``.mop`` file.
+    Open Babel converts that with ``-imop`` (which reads MOPAC Cartesian
+    format correctly) rather than relying on ``.arc`` extension detection,
+    which produces incorrect output in Open Babel 3.1.1.
+
+    Args:
+        arc_file:  Path to the ``.arc`` file produced by MOPAC.
+        sdf_file:  Desired output ``.sdf`` path (same directory).
+        timeout:   Seconds before obabel is killed.
+        overwrite: When False, skip if a ``.sdf`` file already exists.
+
+    Returns:
+        :class:`SdfResult` summarising the conversion.
+    """
+    compound_id = arc_file.stem
+    result = SdfResult(compound_id=compound_id, arc_file=arc_file)
+
+    if not overwrite and sdf_file.exists():
+        result.status = "skipped"
+        result.sdf_file = sdf_file
+        logger.info("[%s] Skipped — .sdf file already exists.", compound_id)
+        return result
+
+    geom_block = _extract_final_geometry(arc_file)
+    if geom_block is None:
+        result.error_message = (
+            "Could not find 'FINAL GEOMETRY OBTAINED' in .arc file — "
+            "the geometry optimisation may not have completed."
+        )
+        return result
+
+    tmp_mop = arc_file.parent / "_opt_tmp.mop"
+    t0 = time.monotonic()
+    try:
+        tmp_mop.write_text(geom_block, encoding="utf-8")
+        res = run_command(
+            cmd=["obabel", "-imop", tmp_mop.name, "-osdf", "-O", sdf_file.name],
+            cwd=arc_file.parent,
+            timeout=timeout,
+            log_file=arc_file.parent / "obabel_sdf.log",
+        )
+    finally:
+        if tmp_mop.exists():
+            tmp_mop.unlink()
+
+    result.duration = time.monotonic() - t0
+
+    if res.timed_out:
+        result.error_message = f"Open Babel timed out after {timeout}s."
+        return result
+
+    if not sdf_file.exists() or sdf_file.stat().st_size == 0:
+        result.error_message = (
+            f"Open Babel finished (rc={res.returncode}) but {sdf_file.name} is "
+            f"missing or empty. stderr: {res.stderr.strip()[:300]}"
+        )
+        return result
+
+    # Fix the molecule title: obabel inherits the temp filename; replace with
+    # the compound_id so the SDF record is correctly labelled.
+    try:
+        content = sdf_file.read_text(encoding="utf-8", errors="replace")
+        first_newline = content.index("\n")
+        sdf_file.write_text(compound_id + content[first_newline:], encoding="utf-8")
+    except (ValueError, OSError):
+        pass  # title fix is cosmetic; don't fail the whole result
+
+    result.status = "success"
+    result.sdf_file = sdf_file
+    logger.info("[%s] SDF exported in %.2fs.", compound_id, result.duration)
+    return result
 
 
 # ---------------------------------------------------------------------------
@@ -1471,6 +1600,116 @@ def run_pipeline(
     csv_path = workdir / "batch_results.csv"
     results_df.to_csv(csv_path, index=False)
     logger.info("Pipeline finished — %d compound(s).  Results → %s", n, csv_path)
+    return results_df
+
+
+def export_sdf(
+    workdir: "str | Path",
+    overwrite: bool = False,
+    timeout: int = 60,
+    max_workers: int = 1,
+) -> pd.DataFrame:
+    """Phase 3 batch: convert optimised MOPAC ``.arc`` files to ``.sdf``.
+
+    Scans ``<workdir>/*/*.arc`` for files produced by :func:`run_mopac_batch`
+    and converts each to an SDF file using Open Babel.  The SDF is written
+    next to the ``.arc`` file as ``<compound_id>.sdf``.
+
+    Only ``.arc`` files are processed; compounds whose MOPAC run failed (no
+    ``.arc`` produced) are automatically excluded.
+
+    Args:
+        workdir:     Root directory used for the previous pipeline phases.
+        overwrite:   Re-convert even when a ``.sdf`` file already exists.
+        timeout:     Per-compound obabel timeout in seconds.
+        max_workers: Number of parallel worker threads.
+
+    Returns:
+        DataFrame with columns: ``compound_id``, ``arc_file``, ``sdf_file``,
+        ``status`` (``success`` / ``failed`` / ``skipped``),
+        ``error_message``, ``duration_s``.  Also saved to
+        ``<workdir>/sdf_results.csv``.
+
+    Raises:
+        EnvironmentError:  If ``obabel`` is not found in PATH.
+        FileNotFoundError: If *workdir* does not exist.
+    """
+    if shutil.which("obabel") is None:
+        raise EnvironmentError(
+            "obabel not found in PATH. Install Open Babel and ensure it is on "
+            "your system PATH, then retry."
+        )
+
+    workdir = Path(workdir).resolve()
+    if not workdir.exists():
+        raise FileNotFoundError(f"workdir does not exist: {workdir}")
+
+    arc_files = sorted(workdir.glob("*/*.arc"))
+    n = len(arc_files)
+    if n == 0:
+        logger.warning("No .arc files found under %s — nothing to convert.", workdir)
+        return pd.DataFrame(
+            columns=["compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s"]
+        )
+
+    logger.info("Found %d .arc file(s) to convert.", n)
+
+    run_kwargs = dict(timeout=timeout, overwrite=overwrite)
+    results: list[Optional[SdfResult]] = [None] * n
+
+    if max_workers == 1:
+        for idx, arc_file in enumerate(arc_files):
+            sdf_file = arc_file.parent / f"{arc_file.stem}.sdf"
+            logger.info("[%d/%d] %s", idx + 1, n, arc_file.stem)
+            try:
+                results[idx] = _convert_arc_to_sdf(arc_file, sdf_file, **run_kwargs)
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[%s] Unexpected exception: %s", arc_file.stem, exc)
+                results[idx] = SdfResult(
+                    compound_id=arc_file.stem, arc_file=arc_file,
+                    status="failed", error_message=f"Unexpected exception: {exc}",
+                )
+    else:
+        logger.info("Parallel SDF export: %d files across %d workers.", n, max_workers)
+        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+            future_to_idx = {
+                pool.submit(
+                    _convert_arc_to_sdf,
+                    arc_file,
+                    arc_file.parent / f"{arc_file.stem}.sdf",
+                    **run_kwargs,
+                ): idx
+                for idx, arc_file in enumerate(arc_files)
+            }
+            completed = 0
+            for future in as_completed(future_to_idx):
+                idx = future_to_idx[future]
+                completed += 1
+                try:
+                    results[idx] = future.result()
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception(
+                        "[%s] Unexpected exception: %s", arc_files[idx].stem, exc,
+                    )
+                    results[idx] = SdfResult(
+                        compound_id=arc_files[idx].stem, arc_file=arc_files[idx],
+                        status="failed", error_message=f"Unexpected exception: {exc}",
+                    )
+                logger.info(
+                    "[%d/%d] %s — %s",
+                    completed, n, results[idx].compound_id, results[idx].status,
+                )
+
+    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
+        columns=["compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s"]
+    )
+
+    csv_path = workdir / "sdf_results.csv"
+    results_df.to_csv(csv_path, index=False)
+    success = (results_df["status"] == "success").sum()
+    logger.info(
+        "SDF export finished — %d file(s), %d converted.  Results → %s", n, success, csv_path
+    )
     return results_df
 
 
