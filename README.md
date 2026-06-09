@@ -125,10 +125,18 @@ prepare_batch(
     obabel_options: list[str] | None = None,
     obabel_timeout: int = 120,
     max_workers: int = 1,
+    auto_charge: bool = False,
 ) -> pd.DataFrame
 ```
 
 Converts SMILES strings to 3D XYZ coordinates (via Open Babel) and writes a MOPAC `.mop` input file for each compound. No MOPAC calculations are performed.
+
+**Key parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `charge_col` | `str \| None` | `None` | Column with explicit integer charges. `CHARGE=n` is appended to keywords for non-zero values. |
+| `auto_charge` | `bool` | `False` | When `True` and `charge_col` is not set, the formal charge is computed from each SMILES using RDKit and added to the keywords as `CHARGE=n` for non-zero values. Requires RDKit (`pip install rdkit`). Ignored when `charge_col` is provided. |
 
 **Returns**
 
@@ -146,6 +154,7 @@ A `DataFrame` with one row per input molecule, saved to `<workdir>/prepare_resul
 **Raises**
 
 - `EnvironmentError` — if `obabel` is not found in PATH.
+- `ImportError` — if `auto_charge=True` and RDKit is not installed.
 - `KeyError` — if a referenced column is absent from `df`.
 
 ---
@@ -211,12 +220,13 @@ run_pipeline(
     obabel_options: list[str] | None = None,
     obabel_timeout: int = 120,
     max_workers: int = 1,
+    auto_charge: bool = False,
 ) -> pd.DataFrame
 ```
 
 Runs both phases (Open Babel + MOPAC) in a single call. Equivalent to `prepare_batch` followed by `run_mopac_batch`. Use this when you do not need to inspect or edit `.mop` files between phases.
 
-**Parameters** — same as `prepare_batch`, with the addition of `timeout` (MOPAC per-compound limit).
+**Parameters** — same as `prepare_batch`, with the addition of `timeout` (MOPAC per-compound limit). `auto_charge` behaves identically to `prepare_batch`.
 
 **Returns** — same schema as `run_mopac_batch`, saved to `<workdir>/batch_results.csv`.
 
@@ -288,7 +298,9 @@ O      3.08132000  1    -0.41155000  1     1.21850000  1
 
 ## Handling charged and open-shell molecules
 
-Pass optional columns for charge and spin multiplicity:
+### Explicit charge column
+
+Pass a column containing formal integer charges:
 
 ```python
 df = pd.DataFrame({
@@ -312,6 +324,28 @@ results = run_mopac_batch(workdir="mopac_jobs")
 
 The generated keywords line for phenolate will be `PM7 PRECISE CHARGE=-1`.  
 The generated keywords line for triplet O2 will be `PM7 PRECISE TRIPLET`.
+
+### Automatic charge detection
+
+When charge information is not available in the dataset, set `auto_charge=True` to have the formal charge computed directly from each SMILES using RDKit:
+
+```python
+prep = prepare_batch(
+    df=df,
+    smiles_col="smiles",
+    id_col="id",
+    keywords="PM7 PRECISE",
+    auto_charge=True,   # detects [NH4+], [O-], etc. automatically
+)
+```
+
+RDKit reads the charge tokens embedded in the SMILES (e.g. `[O-]`, `[NH4+]`, `[Fe+3]`) and appends `CHARGE=n` to the MOPAC keywords for any non-zero value. A log line is emitted for every compound where a non-zero charge is found:
+
+```
+Row 7: auto_charge detected charge=+1.
+```
+
+`auto_charge` is ignored when `charge_col` is provided — the explicit column always takes precedence. RDKit must be installed (`pip install rdkit`).
 
 Supported multiplicities and their MOPAC keywords:
 

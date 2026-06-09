@@ -102,6 +102,39 @@ _SPIN_KEYWORDS: dict[int, str] = {
 
 
 # ---------------------------------------------------------------------------
+# Formal-charge detection via RDKit (used by auto_charge)
+# ---------------------------------------------------------------------------
+
+
+def _compute_formal_charge(smiles: str) -> int:
+    """Return the formal charge of *smiles* using RDKit.
+
+    Args:
+        smiles: A valid SMILES string.
+
+    Returns:
+        Integer formal charge, or 0 if the SMILES cannot be parsed.
+
+    Raises:
+        ImportError: If RDKit is not installed.
+    """
+    try:
+        from rdkit import Chem  # lazy import — only required when auto_charge=True
+    except ImportError:
+        raise ImportError(
+            "RDKit is required for auto_charge=True. "
+            "Install it with:  pip install rdkit"
+        )
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        logger.warning(
+            "auto_charge: could not parse SMILES %r — defaulting to charge=0.", smiles
+        )
+        return 0
+    return Chem.GetFormalCharge(mol)
+
+
+# ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
 
@@ -966,6 +999,7 @@ def _build_job_list(
     workdir: Path,
     charge_col: Optional[str],
     multiplicity_col: Optional[str],
+    auto_charge: bool = False,
 ) -> list[MoleculeJob]:
     """Resolve every DataFrame row into a :class:`MoleculeJob`.
 
@@ -1006,6 +1040,10 @@ def _build_job_list(
                         "Row %d: cannot convert charge %r to int; using 0.",
                         enum_idx, raw_charge,
                     )
+        elif auto_charge and smiles:
+            charge = _compute_formal_charge(smiles)
+            if charge != 0:
+                logger.info("Row %d: auto_charge detected charge=%+d.", enum_idx, charge)
 
         # -- Multiplicity ---------------------------------------------------
         multiplicity = 1
@@ -1070,6 +1108,7 @@ def prepare_batch(
     obabel_options: Optional[list[str]] = None,
     obabel_timeout: int = 120,
     max_workers: int = 1,
+    auto_charge: bool = False,
 ) -> pd.DataFrame:
     """Phase 1 batch: SMILES → 3D coordinates → ``.mop`` files.
 
@@ -1097,6 +1136,12 @@ def prepare_batch(
                           Default: ``["--gen3d"]``.
         obabel_timeout:   Per-compound timeout for the Open Babel subprocess.
         max_workers:      Number of parallel worker threads.
+        auto_charge:      When True and *charge_col* is not set, the formal
+                          charge is computed from each SMILES string using
+                          RDKit and appended to the MOPAC keywords as
+                          ``CHARGE=n`` for non-zero values.  Requires RDKit
+                          (``pip install rdkit``).  Ignored when *charge_col*
+                          is provided.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
@@ -1106,6 +1151,7 @@ def prepare_batch(
 
     Raises:
         EnvironmentError: If ``obabel`` is not found in PATH.
+        ImportError:      If ``auto_charge=True`` and RDKit is not installed.
         KeyError:         If a referenced column is absent from *df*.
     """
     if shutil.which("obabel") is None:
@@ -1126,7 +1172,8 @@ def prepare_batch(
         )
 
     jobs = _build_job_list(
-        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col
+        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col,
+        auto_charge=auto_charge,
     )
     n = len(jobs)
 
@@ -1313,6 +1360,7 @@ def run_pipeline(
     obabel_options: Optional[list[str]] = None,
     obabel_timeout: int = 120,
     max_workers: int = 1,
+    auto_charge: bool = False,
 ) -> pd.DataFrame:
     """Combined pipeline: SMILES → Open Babel → MOPAC in a single call.
 
@@ -1359,7 +1407,8 @@ def run_pipeline(
         )
 
     jobs = _build_job_list(
-        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col
+        df, smiles_col, id_col, keywords, workdir, charge_col, multiplicity_col,
+        auto_charge=auto_charge,
     )
     n = len(jobs)
 
