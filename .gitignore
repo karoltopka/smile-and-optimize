@@ -183,3 +183,4 @@ cython_debug/
 # others
 /mopac_jobs
 .claude/
+/pxr_dataset
