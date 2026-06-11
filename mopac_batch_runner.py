@@ -60,6 +60,11 @@ logger = logging.getLogger(__name__)
 
 OBABEL_DEFAULT_OPTIONS: list[str] = ["--gen3d"]
 
+# Output format used by Open Babel when generating 3D coordinates.
+# Supported values: "xyz" (default), "mol2" (Tripos MOL2), "sdf" (MDL SDF/MOL).
+# Change this if your Open Babel installation does not support XYZ output.
+OBABEL_3D_FORMAT: str = "mol2"
+
 # Fallback option sets tried in order when the primary obabel call produces a
 # crash, NaN coordinates, or an XYZ file with overflowed column values.
 #
@@ -391,28 +396,35 @@ def write_smiles_file(smiles: str, compound_id: str, path: Path) -> None:
 
 def generate_3d_with_obabel(
     smi_file: Path,
-    xyz_file: Path,
+    coord_file: Path,
     obabel_options: Optional[list[str]] = None,
     timeout: int = 120,
+    coord_format: str = "xyz",
 ) -> CommandResult:
-    """Convert a ``.smi`` file to a 3D ``.xyz`` file using the obabel CLI.
+    """Convert a ``.smi`` file to a 3D coordinate file using the obabel CLI.
 
-    The ``-ismi`` input format flag and ``-oxyz -O <xyz_file>`` output flags
-    are always included.  Additional options (e.g. force-field minimisation)
-    can be injected via *obabel_options*; by default only ``--gen3d`` is used.
+    The ``-ismi`` input format flag and ``-o<fmt> -O <coord_file>`` output
+    flags are always included.  Additional options (e.g. force-field
+    minimisation) can be injected via *obabel_options*.
+
+    Supported *coord_format* values: ``"xyz"`` (default), ``"mol2"``,
+    ``"sdf"``.  Use ``"mol2"`` or ``"sdf"`` if your Open Babel build lacks
+    XYZ output support.
 
     An ``obabel.log`` file is written next to *smi_file*.
 
-    Example equivalent shell command::
+    Example equivalent shell command (xyz)::
 
         obabel -ismi input.smi -oxyz -O structure.xyz --gen3d
 
     Args:
         smi_file:       Input ``.smi`` file path.
-        xyz_file:       Desired output ``.xyz`` file path.
+        coord_file:     Desired output file path (extension should match *coord_format*).
         obabel_options: Extra obabel flags appended after the core flags.
                         Defaults to ``OBABEL_DEFAULT_OPTIONS`` (``["--gen3d"]``).
         timeout:        Seconds before the obabel process is killed.
+        coord_format:   Output format passed to obabel (``-o<fmt>``).
+                        Must be one of ``"xyz"``, ``"mol2"``, or ``"sdf"``.
 
     Returns:
         :class:`CommandResult` from the obabel call.
@@ -424,9 +436,9 @@ def generate_3d_with_obabel(
         "obabel",
         "-ismi",
         str(smi_file),
-        "-oxyz",
+        f"-o{coord_format}",
         "-O",
-        str(xyz_file),
+        str(coord_file),
         *obabel_options,
     ]
 
@@ -528,6 +540,128 @@ def parse_xyz(xyz_file: Path) -> list[XYZAtom]:
             )
 
     return atoms
+
+
+def parse_mol2(mol2_file: Path) -> list[XYZAtom]:
+    """Parse a Tripos MOL2 file and return a list of atoms.
+
+    Reads the ``@<TRIPOS>ATOM`` section.  The atom type (e.g. ``C.ar``) is
+    split on ``.`` to extract the element symbol.
+
+    Args:
+        mol2_file: Path to the ``.mol2`` file to read.
+
+    Returns:
+        List of :class:`XYZAtom` objects in file order.
+
+    Raises:
+        ValueError: If no atoms are found in the ``@<TRIPOS>ATOM`` section.
+    """
+    text = mol2_file.read_text(encoding="utf-8", errors="replace")
+    in_atom = False
+    atoms: list[XYZAtom] = []
+    for line in text.splitlines():
+        stripped = line.strip()
+        if stripped == "@<TRIPOS>ATOM":
+            in_atom = True
+            continue
+        if stripped.startswith("@<TRIPOS>") and in_atom:
+            break
+        if not in_atom or not stripped:
+            continue
+        parts = stripped.split()
+        if len(parts) < 6:
+            continue
+        # cols: id  name  x  y  z  type  ...
+        element = parts[5].split(".")[0]
+        try:
+            atoms.append(XYZAtom(element=element, x=float(parts[2]), y=float(parts[3]), z=float(parts[4])))
+        except ValueError as exc:
+            raise ValueError(f"{mol2_file.name}: cannot parse atom line: {line!r}") from exc
+    if not atoms:
+        raise ValueError(f"{mol2_file.name}: no atoms found in @<TRIPOS>ATOM section.")
+    return atoms
+
+
+def parse_sdf(sdf_file: Path) -> list[XYZAtom]:
+    """Parse the first molecule in an MDL SDF/MOL (V2000) file.
+
+    The counts line (line 4, 0-indexed line 3) encodes the atom count in the
+    first three characters.  The following atom lines each encode x, y, z in
+    fixed-width fields (columns 0-9, 10-19, 20-29) and the element symbol in
+    columns 31-33.
+
+    Args:
+        sdf_file: Path to the ``.sdf`` or ``.mol`` file to read.
+
+    Returns:
+        List of :class:`XYZAtom` objects in file order.
+
+    Raises:
+        ValueError: If the file is too short, the atom count cannot be parsed,
+                    or any atom line cannot be parsed.
+    """
+    text = sdf_file.read_text(encoding="utf-8", errors="replace")
+    lines = text.splitlines()
+    if len(lines) < 4:
+        raise ValueError(f"{sdf_file.name}: too short to be a valid SDF file ({len(lines)} lines).")
+    counts_line = lines[3]
+    try:
+        n_atoms = int(counts_line[:3])
+    except ValueError:
+        raise ValueError(
+            f"{sdf_file.name}: cannot parse atom count from counts line: {counts_line!r}"
+        )
+    if n_atoms <= 0:
+        raise ValueError(f"{sdf_file.name}: declares {n_atoms} atoms — nothing to process.")
+    atom_lines = lines[4 : 4 + n_atoms]
+    if len(atom_lines) < n_atoms:
+        raise ValueError(
+            f"{sdf_file.name}: expected {n_atoms} atom lines but found {len(atom_lines)}."
+        )
+    atoms: list[XYZAtom] = []
+    for i, line in enumerate(atom_lines):
+        try:
+            x = float(line[0:10])
+            y = float(line[10:20])
+            z = float(line[20:30])
+            element = line[31:34].strip()
+        except (ValueError, IndexError) as exc:
+            raise ValueError(
+                f"{sdf_file.name} atom line {i + 1}: cannot parse coordinates: {line!r}"
+            ) from exc
+        if not element:
+            raise ValueError(f"{sdf_file.name} atom line {i + 1}: empty element symbol: {line!r}")
+        atoms.append(XYZAtom(element=element, x=x, y=y, z=z))
+    return atoms
+
+
+_SUPPORTED_3D_FORMATS: set[str] = {"xyz", "mol2", "sdf"}
+
+
+def parse_3d_coords(coord_file: Path, fmt: str) -> list[XYZAtom]:
+    """Dispatch to the appropriate parser based on *fmt*.
+
+    Args:
+        coord_file: Path to the 3D coordinate file.
+        fmt:        Format string — one of ``"xyz"``, ``"mol2"``, ``"sdf"``.
+
+    Returns:
+        List of :class:`XYZAtom` objects.
+
+    Raises:
+        ValueError: If *fmt* is not a supported format.
+    """
+    if fmt == "xyz":
+        return parse_xyz(coord_file)
+    if fmt == "mol2":
+        return parse_mol2(coord_file)
+    if fmt == "sdf":
+        return parse_sdf(coord_file)
+    raise ValueError(
+        f"Unsupported 3D coordinate format: {fmt!r}. "
+        f"Choose from: {sorted(_SUPPORTED_3D_FORMATS)}"
+    )
 
 
 def _validate_atom_coords(atoms: list[XYZAtom]) -> Optional[str]:
@@ -835,6 +969,7 @@ def prepare_one_molecule(
     overwrite: bool = False,
     obabel_timeout: int = 120,
     obabel_options: Optional[list[str]] = None,
+    coord_format: str = OBABEL_3D_FORMAT,
 ) -> PrepResult:
     """Run phase 1 of the pipeline for one compound: SMILES → .mop file.
 
@@ -844,8 +979,8 @@ def prepare_one_molecule(
     2. Create the job directory.
     3. Skip early if a ``.mop`` file already exists and *overwrite* is False.
     4. Write the ``.smi`` input file for Open Babel.
-    5. Run Open Babel to produce a 3D ``.xyz`` file (with automatic fallbacks).
-    6. Parse and validate the ``.xyz`` file.
+    5. Run Open Babel to produce a 3D coordinate file (with automatic fallbacks).
+    6. Parse and validate the coordinate file.
     7. Write the MOPAC ``.mop`` input file.
 
     Args:
@@ -853,6 +988,9 @@ def prepare_one_molecule(
         overwrite:       When False, skip if a ``.mop`` file already exists.
         obabel_timeout:  Timeout (s) for the Open Babel subprocess.
         obabel_options:  Extra CLI flags forwarded to obabel.
+        coord_format:    3D coordinate format produced by Open Babel.
+                         One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
+                         Override when your Open Babel build lacks XYZ support.
 
     Returns:
         :class:`PrepResult` with ``status`` ``"ready"``, ``"failed"``, or
@@ -886,7 +1024,7 @@ def prepare_one_molecule(
     primary = obabel_options if obabel_options is not None else list(OBABEL_DEFAULT_OPTIONS)
     option_sets = [primary] + OBABEL_FALLBACK_OPTIONS
 
-    xyz_file = job.job_dir / "structure.xyz"
+    coord_file = job.job_dir / f"structure.{coord_format}"
     atoms: list[XYZAtom] = []
     attempt_error = "No obabel attempt was made."
 
@@ -897,9 +1035,10 @@ def prepare_one_molecule(
         )
         obabel_res = generate_3d_with_obabel(
             smi_file=smi_file,
-            xyz_file=xyz_file,
+            coord_file=coord_file,
             obabel_options=opts,
             timeout=obabel_timeout,
+            coord_format=coord_format,
         )
 
         if obabel_res.timed_out:
@@ -914,18 +1053,18 @@ def prepare_one_molecule(
             logger.debug("[%s] attempt %d failed: %s", job.compound_id, attempt, attempt_error)
             continue
 
-        if not xyz_file.exists() or xyz_file.stat().st_size == 0:
+        if not coord_file.exists() or coord_file.stat().st_size == 0:
             attempt_error = (
-                f"Open Babel returned rc=0 but {xyz_file.name} is missing or empty. "
+                f"Open Babel returned rc=0 but {coord_file.name} is missing or empty. "
                 f"stderr: {obabel_res.stderr.strip()[:300]}"
             )
-            logger.debug("[%s] attempt %d: empty XYZ.", job.compound_id, attempt)
+            logger.debug("[%s] attempt %d: empty coord file.", job.compound_id, attempt)
             continue
 
         try:
-            parsed = parse_xyz(xyz_file)
+            parsed = parse_3d_coords(coord_file, coord_format)
         except ValueError as exc:
-            attempt_error = f"XYZ parse error: {exc}"
+            attempt_error = f"3D coordinate parse error: {exc}"
             logger.debug("[%s] attempt %d: %s", job.compound_id, attempt, attempt_error)
             continue
 
@@ -1064,6 +1203,7 @@ def process_one_molecule(
     obabel_timeout: int = 120,
     mopac_timeout: Optional[int] = 600,
     obabel_options: Optional[list[str]] = None,
+    coord_format: str = OBABEL_3D_FORMAT,
 ) -> JobResult:
     """Execute the complete SMILES → 3D → MOPAC pipeline for one compound.
 
@@ -1079,6 +1219,7 @@ def process_one_molecule(
         mopac_timeout:   Timeout (s) for the MOPAC subprocess; ``None`` = no
                          limit.
         obabel_options:  Extra CLI flags forwarded to obabel.
+        coord_format:    3D coordinate format (``"xyz"``, ``"mol2"``, ``"sdf"``).
 
     Returns:
         :class:`JobResult` summarising the outcome of this compound.
@@ -1099,7 +1240,8 @@ def process_one_molecule(
 
     # Phase 1: always regenerate the .mop when we are not skipping.
     prep = prepare_one_molecule(
-        job, overwrite=True, obabel_timeout=obabel_timeout, obabel_options=obabel_options
+        job, overwrite=True, obabel_timeout=obabel_timeout,
+        obabel_options=obabel_options, coord_format=coord_format,
     )
 
     if prep.status == "failed":
@@ -1238,11 +1380,12 @@ def prepare_batch(
     obabel_timeout: int = 120,
     max_workers: int = 1,
     auto_charge: bool = False,
+    coord_format: str = OBABEL_3D_FORMAT,
 ) -> pd.DataFrame:
     """Phase 1 batch: SMILES → 3D coordinates → ``.mop`` files.
 
     For each row the function generates a job directory, converts the SMILES
-    to a 3D XYZ structure with Open Babel (with automatic fallbacks), and
+    to a 3D coordinate file with Open Babel (with automatic fallbacks), and
     writes a MOPAC ``.mop`` input file.  No MOPAC calculations are performed.
 
     Run :func:`run_mopac_batch` afterwards to submit the prepared jobs to
@@ -1271,6 +1414,10 @@ def prepare_batch(
                           ``CHARGE=n`` for non-zero values.  Requires RDKit
                           (``pip install rdkit``).  Ignored when *charge_col*
                           is provided.
+        coord_format:     3D coordinate format produced by Open Babel.
+                          One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
+                          Use ``"mol2"`` or ``"sdf"`` if your Open Babel build
+                          lacks XYZ output support.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
@@ -1310,6 +1457,7 @@ def prepare_batch(
         overwrite=overwrite,
         obabel_timeout=obabel_timeout,
         obabel_options=obabel_options,
+        coord_format=coord_format,
     )
 
     results: list[Optional[PrepResult]] = [None] * n
@@ -1490,6 +1638,7 @@ def run_pipeline(
     obabel_timeout: int = 120,
     max_workers: int = 1,
     auto_charge: bool = False,
+    coord_format: str = OBABEL_3D_FORMAT,
 ) -> pd.DataFrame:
     """Combined pipeline: SMILES → Open Babel → MOPAC in a single call.
 
@@ -1511,6 +1660,8 @@ def run_pipeline(
         obabel_options:   Extra CLI flags forwarded to obabel.
         obabel_timeout:   Per-compound timeout for the Open Babel subprocess.
         max_workers:      Number of parallel worker threads.
+        coord_format:     3D coordinate format produced by Open Babel.
+                          One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``,
@@ -1546,6 +1697,7 @@ def run_pipeline(
         obabel_timeout=obabel_timeout,
         mopac_timeout=timeout,
         obabel_options=obabel_options,
+        coord_format=coord_format,
     )
 
     results: list[Optional[JobResult]] = [None] * n
