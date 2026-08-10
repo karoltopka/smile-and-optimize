@@ -38,6 +38,7 @@ import logging
 import re
 import shutil
 import subprocess
+import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -162,7 +163,7 @@ class JobResult:
 
     compound_id: str
     smiles: str
-    status: str = "failed"  # success | failed | skipped | timeout
+    status: str = "failed"  # success | failed | skipped | timeout | cancelled
     mop_file: Optional[Path] = None
     out_file: Optional[Path] = None
     arc_file: Optional[Path] = None
@@ -191,7 +192,7 @@ class PrepResult:
 
     compound_id: str
     smiles: str
-    status: str = "failed"  # ready | failed | skipped
+    status: str = "failed"  # ready | failed | skipped | cancelled
     mop_file: Optional[Path] = None
     error_message: Optional[str] = None
     duration: Optional[float] = None
@@ -215,7 +216,7 @@ class SdfResult:
     compound_id: str
     arc_file: Optional[Path] = None
     sdf_file: Optional[Path] = None
-    status: str = "failed"  # success | failed | skipped | no_arc
+    status: str = "failed"  # success | failed | skipped | cancelled
     error_message: Optional[str] = None
     duration: Optional[float] = None
 
@@ -239,6 +240,7 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
+    cancelled: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -289,14 +291,10 @@ def sanitize_id(raw_id: str) -> str:
 # Generic subprocess helper
 # ---------------------------------------------------------------------------
 
-
-def _decode_stream(data: "str | bytes | None") -> str:
-    """Safely decode subprocess stdout/stderr to a plain string."""
-    if data is None:
-        return ""
-    if isinstance(data, bytes):
-        return data.decode("utf-8", errors="replace")
-    return data
+# How often the wait loop below wakes up to check *cancel_event* and the
+# wall-clock *timeout*. Short enough that a STOP click kills the child
+# process within a fraction of a second; long enough not to busy-loop.
+_POLL_INTERVAL: float = 0.2
 
 
 def run_command(
@@ -304,50 +302,74 @@ def run_command(
     cwd: Optional[Path] = None,
     timeout: Optional[int] = None,
     log_file: Optional[Path] = None,
+    cancel_event: Optional[threading.Event] = None,
 ) -> CommandResult:
     """Execute an external command and capture its output.
 
     Does **not** use ``shell=True``.  Pass arguments as a list so that paths
     containing spaces are handled correctly on Windows.
 
+    Runs the child via :class:`subprocess.Popen` and waits on it in short
+    ``_POLL_INTERVAL`` slices (via repeated ``Popen.communicate(timeout=...)``
+    calls — the pattern the :mod:`subprocess` docs themselves recommend for a
+    cancellable wait) instead of a single blocking ``subprocess.run`` call.
+    This lets *cancel_event* be honoured promptly: setting it from another
+    thread kills the child process within about one poll interval, rather
+    than waiting for it to finish on its own or hit *timeout*.
+
     Args:
-        cmd:      Command and arguments as a list.
-        cwd:      Working directory for the child process.
-        timeout:  Seconds before the process is killed; ``None`` = no limit.
-        log_file: When given, a summary + full stdout/stderr is written here.
+        cmd:          Command and arguments as a list.
+        cwd:          Working directory for the child process.
+        timeout:      Seconds before the process is killed; ``None`` = no limit.
+        log_file:     When given, a summary + full stdout/stderr is written here.
+        cancel_event: When set (from another thread) while the process is
+                      running, it is killed immediately instead of being
+                      allowed to run to completion or to *timeout*.
 
     Returns:
         :class:`CommandResult` with ``returncode``, ``stdout``, ``stderr``,
-        and ``timed_out``.
+        ``timed_out``, and ``cancelled``.
     """
     logger.debug("run_command: %s  (cwd=%s)", " ".join(cmd), cwd)
 
     timed_out = False
+    cancelled = False
     stdout = ""
     stderr = ""
     returncode = -1
 
-    try:
-        proc = subprocess.run(
-            cmd,
-            cwd=cwd,
-            capture_output=True,
-            text=True,
-            encoding="utf-8",
-            errors="replace",
-            timeout=timeout,
-        )
-        returncode = proc.returncode
-        stdout = proc.stdout or ""
-        stderr = proc.stderr or ""
+    proc = subprocess.Popen(
+        cmd,
+        cwd=cwd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
 
-    except subprocess.TimeoutExpired as exc:
-        timed_out = True
-        returncode = -1
-        # With text=True the partial output may be str or None; bytes if text
-        # mode was bypassed internally on some platforms — handle all cases.
-        stdout = _decode_stream(exc.stdout)
-        stderr = _decode_stream(exc.stderr)
+    start = time.monotonic()
+    while True:
+        try:
+            stdout, stderr = proc.communicate(timeout=_POLL_INTERVAL)
+            returncode = proc.returncode
+            break
+        except subprocess.TimeoutExpired:
+            if cancel_event is not None and cancel_event.is_set():
+                cancelled = True
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                returncode = proc.returncode
+                break
+            if timeout is not None and (time.monotonic() - start) >= timeout:
+                timed_out = True
+                proc.kill()
+                stdout, stderr = proc.communicate()
+                returncode = proc.returncode
+                break
+
+    stdout = stdout or ""
+    stderr = stderr or ""
 
     if log_file is not None:
         try:
@@ -355,6 +377,7 @@ def run_command(
                 fh.write(f"command    : {' '.join(cmd)}\n")
                 fh.write(f"returncode : {returncode}\n")
                 fh.write(f"timed_out  : {timed_out}\n")
+                fh.write(f"cancelled  : {cancelled}\n")
                 fh.write("\n--- stdout ---\n")
                 fh.write(stdout)
                 fh.write("\n--- stderr ---\n")
@@ -367,6 +390,7 @@ def run_command(
         stdout=stdout,
         stderr=stderr,
         timed_out=timed_out,
+        cancelled=cancelled,
     )
 
 
@@ -400,6 +424,7 @@ def generate_3d_with_obabel(
     obabel_options: Optional[list[str]] = None,
     timeout: int = 120,
     coord_format: str = "xyz",
+    cancel_event: Optional[threading.Event] = None,
 ) -> CommandResult:
     """Convert a ``.smi`` file to a 3D coordinate file using the obabel CLI.
 
@@ -425,6 +450,8 @@ def generate_3d_with_obabel(
         timeout:        Seconds before the obabel process is killed.
         coord_format:   Output format passed to obabel (``-o<fmt>``).
                         Must be one of ``"xyz"``, ``"mol2"``, or ``"sdf"``.
+        cancel_event:   When set from another thread, the obabel process is
+                        killed immediately. See :func:`run_command`.
 
     Returns:
         :class:`CommandResult` from the obabel call.
@@ -447,6 +474,7 @@ def generate_3d_with_obabel(
         cwd=smi_file.parent,
         timeout=timeout,
         log_file=smi_file.parent / "obabel.log",
+        cancel_event=cancel_event,
     )
 
 
@@ -829,6 +857,7 @@ def write_mop_file(
 def run_mopac(
     mop_file: Path,
     timeout: Optional[int] = 600,
+    cancel_event: Optional[threading.Event] = None,
 ) -> CommandResult:
     """Run MOPAC on a single ``.mop`` input file.
 
@@ -838,18 +867,21 @@ def run_mopac(
     A ``mopac_process.log`` file is created in the same directory.
 
     Args:
-        mop_file: Path to the ``.mop`` input file.
-        timeout:  Seconds before MOPAC is killed; ``None`` = no limit.
+        mop_file:     Path to the ``.mop`` input file.
+        timeout:      Seconds before MOPAC is killed; ``None`` = no limit.
+        cancel_event: When set from another thread, MOPAC is killed
+                      immediately. See :func:`run_command`.
 
     Returns:
         :class:`CommandResult` with ``returncode``, ``stdout``, ``stderr``,
-        and ``timed_out``.
+        ``timed_out``, and ``cancelled``.
     """
     return run_command(
         cmd=["mopac", mop_file.name],
         cwd=mop_file.parent,
         timeout=timeout,
         log_file=mop_file.parent / "mopac_process.log",
+        cancel_event=cancel_event,
     )
 
 
@@ -882,6 +914,7 @@ def _convert_arc_to_sdf(
     sdf_file: Path,
     timeout: int = 60,
     overwrite: bool = False,
+    cancel_event: Optional[threading.Event] = None,
 ) -> SdfResult:
     """Convert a single MOPAC ``.arc`` file to ``.sdf`` using obabel.
 
@@ -892,16 +925,25 @@ def _convert_arc_to_sdf(
     which produces incorrect output in Open Babel 3.1.1.
 
     Args:
-        arc_file:  Path to the ``.arc`` file produced by MOPAC.
-        sdf_file:  Desired output ``.sdf`` path (same directory).
-        timeout:   Seconds before obabel is killed.
-        overwrite: When False, skip if a ``.sdf`` file already exists.
+        arc_file:     Path to the ``.arc`` file produced by MOPAC.
+        sdf_file:     Desired output ``.sdf`` path (same directory).
+        timeout:      Seconds before obabel is killed.
+        overwrite:    When False, skip if a ``.sdf`` file already exists.
+        cancel_event: When already set, this compound is skipped immediately
+                      with ``status="cancelled"`` without spawning obabel.
+                      When set while obabel is running, the process is
+                      killed immediately. See :func:`run_command`.
 
     Returns:
         :class:`SdfResult` summarising the conversion.
     """
     compound_id = arc_file.stem
     result = SdfResult(compound_id=compound_id, arc_file=arc_file)
+
+    if cancel_event is not None and cancel_event.is_set():
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user before this compound started."
+        return result
 
     if not overwrite and sdf_file.exists():
         result.status = "skipped"
@@ -926,12 +968,18 @@ def _convert_arc_to_sdf(
             cwd=arc_file.parent,
             timeout=timeout,
             log_file=arc_file.parent / "obabel_sdf.log",
+            cancel_event=cancel_event,
         )
     finally:
         if tmp_mop.exists():
             tmp_mop.unlink()
 
     result.duration = time.monotonic() - t0
+
+    if res.cancelled:
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user."
+        return result
 
     if res.timed_out:
         result.error_message = f"Open Babel timed out after {timeout}s."
@@ -970,6 +1018,7 @@ def prepare_one_molecule(
     obabel_timeout: int = 120,
     obabel_options: Optional[list[str]] = None,
     coord_format: str = OBABEL_3D_FORMAT,
+    cancel_event: Optional[threading.Event] = None,
 ) -> PrepResult:
     """Run phase 1 of the pipeline for one compound: SMILES → .mop file.
 
@@ -991,12 +1040,22 @@ def prepare_one_molecule(
         coord_format:    3D coordinate format produced by Open Babel.
                          One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
                          Override when your Open Babel build lacks XYZ support.
+        cancel_event:    When already set, this compound is skipped
+                         immediately with ``status="cancelled"`` without
+                         spawning obabel. When set while obabel is running,
+                         the process is killed immediately and no further
+                         fallback attempts are tried.
 
     Returns:
-        :class:`PrepResult` with ``status`` ``"ready"``, ``"failed"``, or
-        ``"skipped"``.
+        :class:`PrepResult` with ``status`` ``"ready"``, ``"failed"``,
+        ``"skipped"``, or ``"cancelled"``.
     """
     result = PrepResult(compound_id=job.compound_id, smiles=job.smiles)
+
+    if cancel_event is not None and cancel_event.is_set():
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user before this compound started."
+        return result
 
     if not (job.smiles or "").strip():
         result.error_message = "Empty or blank SMILES string."
@@ -1039,7 +1098,14 @@ def prepare_one_molecule(
             obabel_options=opts,
             timeout=obabel_timeout,
             coord_format=coord_format,
+            cancel_event=cancel_event,
         )
+
+        if obabel_res.cancelled:
+            result.status = "cancelled"
+            result.error_message = "Cancelled by user."
+            result.duration = time.monotonic() - t0
+            return result
 
         if obabel_res.timed_out:
             attempt_error = f"Open Babel timed out after {obabel_timeout}s."
@@ -1119,6 +1185,7 @@ def _run_mopac_one(
     mop_file: Path,
     timeout: Optional[int] = 600,
     overwrite: bool = False,
+    cancel_event: Optional[threading.Event] = None,
 ) -> JobResult:
     """Run MOPAC on a single prepared ``.mop`` file.
 
@@ -1126,9 +1193,13 @@ def _run_mopac_one(
     (line 2 has the form ``<id>  SMILES: <smiles>``).
 
     Args:
-        mop_file:  Absolute path to the ``.mop`` input file.
-        timeout:   Seconds before MOPAC is killed; ``None`` = no limit.
-        overwrite: When False, skip if a ``.out`` file already exists.
+        mop_file:     Absolute path to the ``.mop`` input file.
+        timeout:      Seconds before MOPAC is killed; ``None`` = no limit.
+        overwrite:    When False, skip if a ``.out`` file already exists.
+        cancel_event: When already set, this compound is skipped immediately
+                      with ``status="cancelled"`` without spawning MOPAC.
+                      When set while MOPAC is running, it is killed
+                      immediately.
 
     Returns:
         :class:`JobResult` summarising the MOPAC run.
@@ -1147,6 +1218,11 @@ def _run_mopac_one(
 
     result = JobResult(compound_id=compound_id, smiles=smiles, mop_file=mop_file)
 
+    if cancel_event is not None and cancel_event.is_set():
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user before this compound started."
+        return result
+
     if not overwrite and out_file.exists():
         result.status = "skipped"
         result.out_file = out_file
@@ -1156,10 +1232,16 @@ def _run_mopac_one(
 
     t0 = time.monotonic()
     logger.info("[%s] Running MOPAC ...", compound_id)
-    mopac_res = run_mopac(mop_file, timeout=timeout)
+    mopac_res = run_mopac(mop_file, timeout=timeout, cancel_event=cancel_event)
 
     result.return_code = mopac_res.returncode
     result.duration = time.monotonic() - t0
+
+    if mopac_res.cancelled:
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user."
+        logger.info("[%s] MOPAC cancelled by user.", compound_id)
+        return result
 
     if mopac_res.timed_out:
         result.status = "timeout"
@@ -1204,6 +1286,7 @@ def process_one_molecule(
     mopac_timeout: Optional[int] = 600,
     obabel_options: Optional[list[str]] = None,
     coord_format: str = OBABEL_3D_FORMAT,
+    cancel_event: Optional[threading.Event] = None,
 ) -> JobResult:
     """Execute the complete SMILES → 3D → MOPAC pipeline for one compound.
 
@@ -1220,6 +1303,10 @@ def process_one_molecule(
                          limit.
         obabel_options:  Extra CLI flags forwarded to obabel.
         coord_format:    3D coordinate format (``"xyz"``, ``"mol2"``, ``"sdf"``).
+        cancel_event:    When already set, this compound is skipped
+                         immediately with ``status="cancelled"``. When set
+                         while obabel/MOPAC is running, it is killed
+                         immediately. See :func:`run_command`.
 
     Returns:
         :class:`JobResult` summarising the outcome of this compound.
@@ -1227,6 +1314,12 @@ def process_one_molecule(
     out_file = job.job_dir / f"{job.compound_id}.out"
     arc_file = job.job_dir / f"{job.compound_id}.arc"
     mop_file = job.job_dir / f"{job.compound_id}.mop"
+
+    if cancel_event is not None and cancel_event.is_set():
+        result = JobResult(compound_id=job.compound_id, smiles=job.smiles)
+        result.status = "cancelled"
+        result.error_message = "Cancelled by user before this compound started."
+        return result
 
     # Combined-pipeline skip: based on .out, not .mop.
     if not overwrite and out_file.exists():
@@ -1242,16 +1335,20 @@ def process_one_molecule(
     prep = prepare_one_molecule(
         job, overwrite=True, obabel_timeout=obabel_timeout,
         obabel_options=obabel_options, coord_format=coord_format,
+        cancel_event=cancel_event,
     )
 
-    if prep.status == "failed":
+    if prep.status in ("failed", "cancelled"):
         result = JobResult(compound_id=job.compound_id, smiles=job.smiles)
+        result.status = "failed" if prep.status == "failed" else "cancelled"
         result.error_message = prep.error_message
         result.duration = prep.duration
         return result
 
     # Phase 2: run MOPAC (always, since we just wrote a fresh .mop).
-    result = _run_mopac_one(prep.mop_file, timeout=mopac_timeout, overwrite=True)
+    result = _run_mopac_one(
+        prep.mop_file, timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event,
+    )
     # Total duration = obabel time + MOPAC time.
     result.duration = (prep.duration or 0.0) + (result.duration or 0.0)
     return result
@@ -1367,6 +1464,34 @@ def _build_job_list(
 # ---------------------------------------------------------------------------
 
 
+def _log_batch_finished(
+    label: str,
+    results_df: pd.DataFrame,
+    csv_path: Path,
+    cancel_event: Optional[threading.Event] = None,
+) -> None:
+    """Log a completion summary that reports a per-status breakdown and
+    explicitly flags a user-initiated stop.
+
+    A plain "finished — N compound(s)" message (the previous behaviour)
+    reads as if everything completed normally even when the run was
+    interrupted via *cancel_event* partway through — this makes both the
+    outcome mix and the interruption visible in the same line.
+    """
+    n = len(results_df)
+    if n and "status" in results_df.columns:
+        counts_text = ", ".join(
+            f"{status}: {count}" for status, count in results_df["status"].value_counts().items()
+        )
+    else:
+        counts_text = "no rows"
+    stopped_note = " (stopped by user)" if cancel_event is not None and cancel_event.is_set() else ""
+    logger.info(
+        "%s finished%s — %d compound(s): %s.  Results → %s",
+        label, stopped_note, n, counts_text, csv_path,
+    )
+
+
 def prepare_batch(
     df: pd.DataFrame,
     smiles_col: str,
@@ -1381,6 +1506,7 @@ def prepare_batch(
     max_workers: int = 1,
     auto_charge: bool = False,
     coord_format: str = OBABEL_3D_FORMAT,
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     """Phase 1 batch: SMILES → 3D coordinates → ``.mop`` files.
 
@@ -1418,10 +1544,14 @@ def prepare_batch(
                           One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
                           Use ``"mol2"`` or ``"sdf"`` if your Open Babel build
                           lacks XYZ output support.
+        cancel_event:     When set (from another thread) while this is
+                          running, any compound not yet started is skipped
+                          with ``status="cancelled"`` and the in-flight
+                          obabel process (if any) is killed immediately.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
-        (``ready`` / ``failed`` / ``skipped``), ``mop_file``,
+        (``ready`` / ``failed`` / ``skipped`` / ``cancelled``), ``mop_file``,
         ``error_message``, ``duration_s``.  Also saved to
         ``<workdir>/prepare_results.csv``.
 
@@ -1458,6 +1588,7 @@ def prepare_batch(
         obabel_timeout=obabel_timeout,
         obabel_options=obabel_options,
         coord_format=coord_format,
+        cancel_event=cancel_event,
     )
 
     results: list[Optional[PrepResult]] = [None] * n
@@ -1507,10 +1638,7 @@ def prepare_batch(
 
     csv_path = workdir / "prepare_results.csv"
     results_df.to_csv(csv_path, index=False)
-    ready = (results_df["status"] == "ready").sum()
-    logger.info(
-        "Prepare finished — %d compound(s), %d ready.  Results → %s", n, ready, csv_path
-    )
+    _log_batch_finished("Prepare", results_df, csv_path, cancel_event)
     return results_df
 
 
@@ -1519,6 +1647,7 @@ def run_mopac_batch(
     overwrite: bool = False,
     timeout: Optional[int] = 600,
     max_workers: int = 1,
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     """Phase 2 batch: run MOPAC on all ``.mop`` files found in *workdir*.
 
@@ -1528,19 +1657,24 @@ def run_mopac_batch(
     DataFrame is required.
 
     Args:
-        workdir:     Root directory that was used for :func:`prepare_batch`.
-                     All ``<id>/<id>.mop`` files beneath it are discovered
-                     automatically.
-        overwrite:   Re-run even when a ``.out`` file already exists.
-        timeout:     Per-compound MOPAC timeout in seconds.  ``None`` = no
-                     limit.
-        max_workers: Number of parallel worker threads.
+        workdir:      Root directory that was used for :func:`prepare_batch`.
+                      All ``<id>/<id>.mop`` files beneath it are discovered
+                      automatically.
+        overwrite:    Re-run even when a ``.out`` file already exists.
+        timeout:      Per-compound MOPAC timeout in seconds.  ``None`` = no
+                      limit.
+        max_workers:  Number of parallel worker threads.
+        cancel_event: When set (from another thread) while this is running,
+                      any compound not yet started is skipped with
+                      ``status="cancelled"`` and the in-flight MOPAC
+                      process(es) (if any) are killed immediately.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
-        (``success`` / ``failed`` / ``skipped`` / ``timeout``), ``mop_file``,
-        ``out_file``, ``arc_file``, ``error_message``, ``return_code``,
-        ``duration_s``.  Also saved to ``<workdir>/batch_results.csv``.
+        (``success`` / ``failed`` / ``skipped`` / ``timeout`` /
+        ``cancelled``), ``mop_file``, ``out_file``, ``arc_file``,
+        ``error_message``, ``return_code``, ``duration_s``.  Also saved to
+        ``<workdir>/batch_results.csv``.
 
     Raises:
         EnvironmentError: If ``mopac`` is not found in PATH.
@@ -1570,7 +1704,7 @@ def run_mopac_batch(
 
     logger.info("Found %d .mop file(s) in %s.", n, workdir)
 
-    run_kwargs = dict(timeout=timeout, overwrite=overwrite)
+    run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
     results: list[Optional[JobResult]] = [None] * n
 
     if max_workers == 1:
@@ -1620,7 +1754,7 @@ def run_mopac_batch(
 
     csv_path = workdir / "batch_results.csv"
     results_df.to_csv(csv_path, index=False)
-    logger.info("MOPAC batch finished — %d compound(s).  Results → %s", n, csv_path)
+    _log_batch_finished("MOPAC batch", results_df, csv_path, cancel_event)
     return results_df
 
 
@@ -1639,6 +1773,7 @@ def run_pipeline(
     max_workers: int = 1,
     auto_charge: bool = False,
     coord_format: str = OBABEL_3D_FORMAT,
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     """Combined pipeline: SMILES → Open Babel → MOPAC in a single call.
 
@@ -1662,6 +1797,11 @@ def run_pipeline(
         max_workers:      Number of parallel worker threads.
         coord_format:     3D coordinate format produced by Open Babel.
                           One of ``"xyz"`` (default), ``"mol2"``, ``"sdf"``.
+        cancel_event:     When set (from another thread) while this is
+                          running, any compound not yet started is skipped
+                          with ``status="cancelled"`` and the in-flight
+                          obabel/MOPAC process(es) (if any) are killed
+                          immediately.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``,
@@ -1698,6 +1838,7 @@ def run_pipeline(
         mopac_timeout=timeout,
         obabel_options=obabel_options,
         coord_format=coord_format,
+        cancel_event=cancel_event,
     )
 
     results: list[Optional[JobResult]] = [None] * n
@@ -1751,7 +1892,7 @@ def run_pipeline(
 
     csv_path = workdir / "batch_results.csv"
     results_df.to_csv(csv_path, index=False)
-    logger.info("Pipeline finished — %d compound(s).  Results → %s", n, csv_path)
+    _log_batch_finished("Pipeline", results_df, csv_path, cancel_event)
     return results_df
 
 
@@ -1760,6 +1901,7 @@ def export_sdf(
     overwrite: bool = False,
     timeout: int = 60,
     max_workers: int = 1,
+    cancel_event: Optional[threading.Event] = None,
 ) -> pd.DataFrame:
     """Phase 3 batch: convert optimised MOPAC ``.arc`` files to ``.sdf``.
 
@@ -1771,14 +1913,18 @@ def export_sdf(
     ``.arc`` produced) are automatically excluded.
 
     Args:
-        workdir:     Root directory used for the previous pipeline phases.
-        overwrite:   Re-convert even when a ``.sdf`` file already exists.
-        timeout:     Per-compound obabel timeout in seconds.
-        max_workers: Number of parallel worker threads.
+        workdir:      Root directory used for the previous pipeline phases.
+        overwrite:    Re-convert even when a ``.sdf`` file already exists.
+        timeout:      Per-compound obabel timeout in seconds.
+        max_workers:  Number of parallel worker threads.
+        cancel_event: When set (from another thread) while this is running,
+                      any compound not yet started is skipped with
+                      ``status="cancelled"`` and the in-flight obabel
+                      process (if any) is killed immediately.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``arc_file``, ``sdf_file``,
-        ``status`` (``success`` / ``failed`` / ``skipped``),
+        ``status`` (``success`` / ``failed`` / ``skipped`` / ``cancelled``),
         ``error_message``, ``duration_s``.  Also saved to
         ``<workdir>/sdf_results.csv``.
 
@@ -1806,7 +1952,7 @@ def export_sdf(
 
     logger.info("Found %d .arc file(s) to convert.", n)
 
-    run_kwargs = dict(timeout=timeout, overwrite=overwrite)
+    run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
     results: list[Optional[SdfResult]] = [None] * n
 
     if max_workers == 1:
@@ -1858,11 +2004,313 @@ def export_sdf(
 
     csv_path = workdir / "sdf_results.csv"
     results_df.to_csv(csv_path, index=False)
-    success = (results_df["status"] == "success").sum()
-    logger.info(
-        "SDF export finished — %d file(s), %d converted.  Results → %s", n, success, csv_path
-    )
+    _log_batch_finished("SDF export", results_df, csv_path, cancel_event)
     return results_df
+
+
+# ---------------------------------------------------------------------------
+# Retry: re-run failed/timed-out jobs with extended settings
+# ---------------------------------------------------------------------------
+
+
+def _merge_retry_results(
+    existing_df: pd.DataFrame,
+    new_df: pd.DataFrame,
+    key: str = "compound_id",
+) -> pd.DataFrame:
+    """Merge *new_df* rows into *existing_df* by *key*, fully overwriting matches.
+
+    Unlike ``DataFrame.update()``, this also overwrites columns that go back
+    to ``None``/NaN in *new_df* (e.g. ``error_message`` clearing to ``None``
+    on a successful retry) instead of silently keeping the stale value —
+    ``update()`` treats NaN in the incoming frame as "leave the old value
+    alone," which would leave a recovered compound's old error message in
+    place.
+
+    Args:
+        existing_df: Previously saved results (e.g. loaded from
+                     ``batch_results.csv``). May be empty.
+        new_df:      Fresh results for a subset of the same *key* values.
+        key:         Column to align rows on.
+
+    Returns:
+        *existing_df* with matching rows overwritten and any brand-new keys
+        appended.
+    """
+    if new_df.empty:
+        return existing_df
+    if existing_df.empty:
+        return new_df.reset_index(drop=True)
+
+    existing = existing_df.set_index(key)
+    new = new_df.set_index(key)
+
+    for col in new.columns:
+        if col not in existing.columns:
+            existing[col] = None
+        else:
+            # Columns loaded from CSV that were all-NaN in `existing` (e.g.
+            # error_message on a prior timeout) get an incompatible numeric
+            # dtype (float64). Widen to object so string values from `new`
+            # can be assigned without pandas raising a dtype-coercion error.
+            existing[col] = existing[col].astype(object)
+
+    matched = new.index.intersection(existing.index)
+    new_rows = new.index.difference(existing.index)
+
+    if len(matched) > 0:
+        existing.loc[matched, new.columns] = new.loc[matched, new.columns]
+    if len(new_rows) > 0:
+        existing = pd.concat([existing, new.loc[new_rows]])
+
+    return existing.reset_index()
+
+
+def retry_failed_batch(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: Optional[str] = None,
+    keywords: str = "PM7 PRECISE GEO-OK",
+    workdir: "str | Path" = "mopac_jobs",
+    charge_col: Optional[str] = None,
+    multiplicity_col: Optional[str] = None,
+    auto_charge: bool = False,
+    coord_format: str = OBABEL_3D_FORMAT,
+    obabel_options: Optional[list[str]] = None,
+    obabel_timeout: int = 240,
+    mopac_timeout: Optional[int] = 1800,
+    retry_keywords: Optional[str] = None,
+    max_workers: int = 1,
+    cancel_event: Optional[threading.Event] = None,
+) -> pd.DataFrame:
+    """Re-run compounds that failed, timed out, or were cancelled in a
+    previous batch.
+
+    Reads ``<workdir>/prepare_results.csv`` and ``<workdir>/batch_results.csv``
+    (as written by :func:`prepare_batch` / :func:`run_mopac_batch`) to find
+    which compounds still need work, retries only those — using extended
+    timeouts and, optionally, a different MOPAC keyword string — and merges
+    the outcomes back into both CSVs. Compounds that already succeeded are
+    left untouched.
+
+    Two independent retry passes happen:
+
+    1. Compounds with ``status in {"failed", "cancelled"}`` in
+       ``prepare_results.csv`` (Open Babel never produced a ``.mop`` file)
+       are retried with *obabel_timeout*.
+    2. Compounds with ``status in {"failed", "timeout", "cancelled"}`` in
+       ``batch_results.csv``, plus any compound that just became ``ready``
+       in step 1, are retried with *mopac_timeout*.
+
+    A compound that was previously stopped via *cancel_event* (i.e. ended up
+    with ``status="cancelled"``) is therefore retried exactly like a
+    genuine failure or timeout — stopping a run and retrying afterward
+    compose naturally with no extra bookkeeping needed.
+
+    Args:
+        df:               The **same** DataFrame (same rows, same order)
+                          passed to the original :func:`prepare_batch` call.
+                          Compound-ID assignment (auto sequential IDs,
+                          duplicate-ID suffixing) depends on enumerating the
+                          full DataFrame in its original order — a filtered
+                          or reordered DataFrame will not line up with the
+                          existing job directories.
+        smiles_col:       Column name holding SMILES strings.
+        id_col:           Same *id_col* used for the original run.
+        keywords:         Same *keywords* used for the original run. Used to
+                          rebuild charge/multiplicity/ID assignment for every
+                          job; superseded by *retry_keywords* (if given) when
+                          actually writing retried ``.mop`` files.
+        workdir:          Root directory used for the previous pipeline runs.
+        charge_col:       Same *charge_col* used for the original run.
+        multiplicity_col: Same *multiplicity_col* used for the original run.
+        auto_charge:      Same *auto_charge* used for the original run.
+        coord_format:     Same *coord_format* used for the original run.
+        obabel_options:   Extra obabel CLI flags for the retry's Open Babel
+                          attempts. Defaults to ``OBABEL_DEFAULT_OPTIONS``.
+        obabel_timeout:   Per-compound Open Babel timeout for the retry pass.
+        mopac_timeout:    Per-compound MOPAC timeout for the retry pass.
+        retry_keywords:   When given, used instead of *keywords* for every
+                          retried compound (e.g. to relax convergence
+                          criteria). ``None`` reuses *keywords* unchanged.
+        max_workers:      Number of parallel worker threads.
+        cancel_event:     When set (from another thread) while this is
+                          running, any compound not yet started is skipped
+                          with ``status="cancelled"`` and the in-flight
+                          obabel/MOPAC process(es) (if any) are killed
+                          immediately.
+
+    Returns:
+        The updated ``batch_results.csv`` DataFrame (same schema as
+        :func:`run_mopac_batch`), covering all compounds — not just the
+        retried ones. Also saved back to ``<workdir>/batch_results.csv``
+        (and ``<workdir>/prepare_results.csv`` is updated in place too).
+
+    Raises:
+        EnvironmentError:  If ``obabel`` or ``mopac`` is not found in PATH.
+        FileNotFoundError: If *workdir* does not exist.
+        KeyError:          If a referenced column is absent from *df*.
+    """
+    validate_environment()
+
+    workdir = Path(workdir).resolve()
+    if not workdir.exists():
+        raise FileNotFoundError(f"workdir does not exist: {workdir}")
+
+    optional_cols = [c for c in (id_col, charge_col, multiplicity_col) if c]
+    missing_cols = [c for c in [smiles_col, *optional_cols] if c not in df.columns]
+    if missing_cols:
+        raise KeyError(
+            f"Column(s) not found in DataFrame: {missing_cols}. "
+            f"Available columns: {list(df.columns)}"
+        )
+
+    prepare_csv = workdir / "prepare_results.csv"
+    batch_csv = workdir / "batch_results.csv"
+
+    prepare_cols = ["compound_id", "smiles", "status", "mop_file", "error_message", "duration_s"]
+    batch_cols = [
+        "compound_id", "smiles", "status",
+        "mop_file", "out_file", "arc_file",
+        "error_message", "return_code", "duration_s",
+    ]
+
+    prepare_df = pd.read_csv(prepare_csv) if prepare_csv.exists() else pd.DataFrame(columns=prepare_cols)
+    batch_df = pd.read_csv(batch_csv) if batch_csv.exists() else pd.DataFrame(columns=batch_cols)
+
+    obabel_retry_ids = (
+        set(prepare_df.loc[prepare_df["status"].isin(["failed", "cancelled"]), "compound_id"])
+        if not prepare_df.empty else set()
+    )
+    mopac_retry_ids = (
+        set(batch_df.loc[batch_df["status"].isin(["failed", "timeout", "cancelled"]), "compound_id"])
+        if not batch_df.empty else set()
+    )
+
+    if not obabel_retry_ids and not mopac_retry_ids:
+        logger.info("Nothing to retry — no failed/timeout compounds found in %s.", workdir)
+        return batch_df
+
+    effective_keywords = retry_keywords if retry_keywords else keywords
+
+    jobs = _build_job_list(
+        df, smiles_col, id_col, effective_keywords, workdir,
+        charge_col, multiplicity_col, auto_charge=auto_charge,
+    )
+    jobs_by_id = {j.compound_id: j for j in jobs}
+
+    missing = (obabel_retry_ids | mopac_retry_ids) - jobs_by_id.keys()
+    if missing:
+        logger.warning(
+            "Retry: %d compound id(s) from previous results not found in the "
+            "current DataFrame — skipping: %s", len(missing), sorted(missing),
+        )
+
+    # -- Phase-1 retry: obabel-stage failures --------------------------------
+    obabel_jobs = [jobs_by_id[i] for i in obabel_retry_ids if i in jobs_by_id]
+    prep_retry_results: list[PrepResult] = []
+
+    if obabel_jobs:
+        logger.info(
+            "Retrying %d obabel-stage failure(s) with timeout=%ds.",
+            len(obabel_jobs), obabel_timeout,
+        )
+        prep_kwargs = dict(
+            overwrite=True, obabel_timeout=obabel_timeout,
+            obabel_options=obabel_options, coord_format=coord_format,
+            cancel_event=cancel_event,
+        )
+        if max_workers == 1:
+            for job in obabel_jobs:
+                try:
+                    prep_retry_results.append(prepare_one_molecule(job=job, **prep_kwargs))
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
+                    prep_retry_results.append(PrepResult(
+                        compound_id=job.compound_id, smiles=job.smiles,
+                        status="failed", error_message=f"Unexpected exception: {exc}",
+                    ))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_job = {
+                    pool.submit(prepare_one_molecule, job=job, **prep_kwargs): job
+                    for job in obabel_jobs
+                }
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    try:
+                        prep_retry_results.append(future.result())
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
+                        prep_retry_results.append(PrepResult(
+                            compound_id=job.compound_id, smiles=job.smiles,
+                            status="failed", error_message=f"Unexpected exception: {exc}",
+                        ))
+
+        prep_retry_df = pd.DataFrame([r.to_dict() for r in prep_retry_results])
+        prepare_df = _merge_retry_results(prepare_df, prep_retry_df)
+        prepare_df.to_csv(prepare_csv, index=False)
+
+    newly_ready_ids = {r.compound_id for r in prep_retry_results if r.status == "ready"}
+
+    # -- Phase-2 retry: mopac-stage failures + freshly-prepared retries -----
+    mopac_targets = mopac_retry_ids | newly_ready_ids
+    mopac_target_jobs = [
+        jobs_by_id[i] for i in mopac_targets
+        if i in jobs_by_id and (workdir / i / f"{i}.mop").exists()
+    ]
+
+    mopac_retry_results: list[JobResult] = []
+
+    if mopac_target_jobs:
+        logger.info(
+            "Retrying %d MOPAC-stage job(s) with timeout=%s.",
+            len(mopac_target_jobs), mopac_timeout,
+        )
+        run_kwargs = dict(timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event)
+
+        if max_workers == 1:
+            for job in mopac_target_jobs:
+                mop_file = job.job_dir / f"{job.compound_id}.mop"
+                try:
+                    mopac_retry_results.append(_run_mopac_one(mop_file, **run_kwargs))
+                except Exception as exc:  # pylint: disable=broad-except
+                    logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
+                    mopac_retry_results.append(JobResult(
+                        compound_id=job.compound_id, smiles=job.smiles,
+                        status="failed", error_message=f"Unexpected exception: {exc}",
+                    ))
+        else:
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                future_to_job = {
+                    pool.submit(_run_mopac_one, job.job_dir / f"{job.compound_id}.mop", **run_kwargs): job
+                    for job in mopac_target_jobs
+                }
+                for future in as_completed(future_to_job):
+                    job = future_to_job[future]
+                    try:
+                        mopac_retry_results.append(future.result())
+                    except Exception as exc:  # pylint: disable=broad-except
+                        logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
+                        mopac_retry_results.append(JobResult(
+                            compound_id=job.compound_id, smiles=job.smiles,
+                            status="failed", error_message=f"Unexpected exception: {exc}",
+                        ))
+
+        mopac_retry_df = pd.DataFrame([r.to_dict() for r in mopac_retry_results])
+        batch_df = _merge_retry_results(batch_df, mopac_retry_df)
+        batch_df.to_csv(batch_csv, index=False)
+
+    recovered = sum(1 for r in mopac_retry_results if r.status == "success")
+    still_failed_obabel = len(obabel_jobs) - len(newly_ready_ids)
+    stopped_note = " (stopped by user)" if cancel_event is not None and cancel_event.is_set() else ""
+    logger.info(
+        "Retry finished%s — MOPAC: %d/%d recovered. Obabel: %d/%d still failing. "
+        "Results → %s",
+        stopped_note, recovered, len(mopac_target_jobs), still_failed_obabel, len(obabel_jobs), batch_csv,
+    )
+
+    return batch_df
 
 
 # ---------------------------------------------------------------------------

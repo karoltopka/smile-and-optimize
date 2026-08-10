@@ -10,6 +10,7 @@ directly with:
 from __future__ import annotations
 
 import functools
+import json
 import logging
 import os
 import queue
@@ -48,15 +49,40 @@ from PySide6.QtWidgets import (
 from mopac_batch_runner import (
     export_sdf,
     prepare_batch,
+    retry_failed_batch,
     run_mopac_batch,
     validate_environment,
 )
 
 DEFAULT_WORKERS = min(4, os.cpu_count() or 4)
-APP_VERSION = "1.0.0"
-APP_AUTHOR = "Maciej Gromelski"
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "icon.png"
+
+PROVENANCE_PATH = Path(__file__).resolve().parent / "provenance.json"
+# Kept in sync with provenance.json; used only if that file is missing or
+# malformed so a broken/deleted provenance file can't stop the app launching.
+_DEFAULT_PROVENANCE = {
+    "author": "Maciej Gromelski",
+    "version": "1.1.0",
+    "year": 2026,
+    "contact_email": "maciek.gromelski@gmail.com",
+}
+
+
+def _load_provenance() -> dict:
+    """Load author/version/year/contact info for the footer from provenance.json."""
+    try:
+        data = json.loads(PROVENANCE_PATH.read_text(encoding="utf-8"))
+        return {**_DEFAULT_PROVENANCE, **data}
+    except (OSError, ValueError) as exc:
+        print(
+            f"Warning: could not load {PROVENANCE_PATH.name} ({exc}); using built-in defaults.",
+            file=sys.stderr,
+        )
+        return dict(_DEFAULT_PROVENANCE)
+
+
+PROVENANCE = _load_provenance()
 
 APP_STYLESHEET = """
 /* ============================================================
@@ -180,6 +206,34 @@ QPushButton#primaryButton:disabled {
     background: #D9D9D9;
     color: #9AA0A2;
     border: 1px solid #C7C7C7;
+}
+
+/* ============================================================
+   STOP button (objectName="stopButton") -- kills the running phase's
+   in-flight obabel/MOPAC process(es) immediately. Disabled (grey, same
+   convention as the other buttons' :disabled state) whenever no phase is
+   running; red outline/fill otherwise so it reads as a danger action.
+   ============================================================ */
+QPushButton#stopButton {
+    background-color: #FFFFFF;
+    color: #B00020;
+    border: 2px solid #B00020;
+    border-radius: 6px;
+    padding: 8px 18px;
+    font-weight: 700;
+}
+QPushButton#stopButton:hover {
+    background-color: #FDECEA;
+    border: 2px solid #8E0018;
+}
+QPushButton#stopButton:pressed {
+    background-color: #B00020;
+    color: #FFFFFF;
+}
+QPushButton#stopButton:disabled {
+    background-color: #D9D9D9;
+    color: #9AA0A2;
+    border: 2px solid #C7C7C7;
 }
 
 /* ============================================================
@@ -433,6 +487,9 @@ class MainWindow(QMainWindow):
         self._mopac_succeeded: bool = False
         self._phase_running: bool = False
         self._settings_locked: bool = False
+        self._last_prepare_df: pd.DataFrame | None = None
+        self._last_batch_df: pd.DataFrame | None = None
+        self._cancel_event: threading.Event = threading.Event()
 
         self._build_ui()
         self._build_footer()
@@ -456,20 +513,21 @@ class MainWindow(QMainWindow):
         root.addLayout(columns, stretch=1)
 
     def _build_left_column(self) -> QVBoxLayout:
-        """Configuration side: environment status, inputs, settings, run buttons."""
+        """Configuration side: environment status, inputs, settings, retry."""
         col = QVBoxLayout()
         col.addLayout(self._build_env_row())
         col.addWidget(self._build_input_group())
         col.addWidget(self._build_workdir_group())
         col.addWidget(self._build_settings_group())
         col.addLayout(self._build_save_settings_row())
-        col.addLayout(self._build_actions_row())
+        col.addLayout(self._build_retry_row())
         col.addStretch(1)
         return col
 
     def _build_right_column(self) -> QVBoxLayout:
-        """Results side: summary, results table, log console -- kept larger/taller."""
+        """Results side: workflow buttons, summary, results table, log console."""
         col = QVBoxLayout()
+        col.addLayout(self._build_workflow_row())
 
         self.summary_label = QLabel("No phase has been run yet.")
         self.summary_label.setObjectName("summaryLabel")
@@ -490,7 +548,10 @@ class MainWindow(QMainWindow):
         return col
 
     def _build_footer(self) -> None:
-        footer_label = QLabel(f"Created by {APP_AUTHOR}   |   v{APP_VERSION}")
+        footer_label = QLabel(
+            f"Created by {PROVENANCE['author']}   |   v{PROVENANCE['version']}   |   "
+            f"© {PROVENANCE['year']}   |   {PROVENANCE['contact_email']}"
+        )
         footer_label.setObjectName("footerLabel")
         self.statusBar().addPermanentWidget(footer_label)
 
@@ -592,6 +653,12 @@ class MainWindow(QMainWindow):
         self.export_workers_spin = self._make_workers_spin()
         form.addRow("Export workers:", self.export_workers_spin)
 
+        self.obabel_timeout_spin = QSpinBox()
+        self.obabel_timeout_spin.setRange(1, 100000)
+        self.obabel_timeout_spin.setValue(120)
+        self.obabel_timeout_spin.setSuffix(" s")
+        form.addRow("Prepare (obabel) timeout:", self.obabel_timeout_spin)
+
         self.mopac_timeout_spin = QSpinBox()
         self.mopac_timeout_spin.setRange(1, 100000)
         self.mopac_timeout_spin.setValue(900)
@@ -603,6 +670,26 @@ class MainWindow(QMainWindow):
         self.export_timeout_spin.setValue(60)
         self.export_timeout_spin.setSuffix(" s")
         form.addRow("Export timeout:", self.export_timeout_spin)
+
+        retry_separator = QLabel("Retry settings (used only by “Retry Failed Jobs”)")
+        retry_separator.setStyleSheet("font-weight: 600; padding-top: 6px;")
+        form.addRow(retry_separator)
+
+        self.retry_obabel_timeout_spin = QSpinBox()
+        self.retry_obabel_timeout_spin.setRange(1, 100000)
+        self.retry_obabel_timeout_spin.setValue(300)
+        self.retry_obabel_timeout_spin.setSuffix(" s")
+        form.addRow("Retry obabel timeout:", self.retry_obabel_timeout_spin)
+
+        self.retry_mopac_timeout_spin = QSpinBox()
+        self.retry_mopac_timeout_spin.setRange(1, 100000)
+        self.retry_mopac_timeout_spin.setValue(1800)
+        self.retry_mopac_timeout_spin.setSuffix(" s")
+        form.addRow("Retry MOPAC timeout:", self.retry_mopac_timeout_spin)
+
+        self.retry_keywords_edit = QLineEdit()
+        self.retry_keywords_edit.setPlaceholderText("(leave blank to reuse the MOPAC keywords above)")
+        form.addRow("Retry MOPAC keywords:", self.retry_keywords_edit)
 
         self.copy_sdf_check = QCheckBox("Also copy all SDFs to a separate results folder")
         self.copy_sdf_check.setChecked(True)
@@ -638,7 +725,14 @@ class MainWindow(QMainWindow):
         spin.setValue(DEFAULT_WORKERS)
         return spin
 
-    def _build_actions_row(self) -> QHBoxLayout:
+    def _build_workflow_row(self) -> QHBoxLayout:
+        """The three sequential phase buttons + STOP + progress bar.
+
+        Lives at the top of the right column, above the results table/log,
+        since that's what the user is watching while a phase runs. Retry
+        Failed Jobs is deliberately NOT here -- see _build_retry_row(), kept
+        on the left near the retry settings it reads from.
+        """
         row = QHBoxLayout()
 
         self.prepare_button = QPushButton("1. Prepare (SMILES -> .mop)")
@@ -653,6 +747,11 @@ class MainWindow(QMainWindow):
         self.export_sdf_button.setObjectName("primaryButton")
         self.export_sdf_button.clicked.connect(self._on_export_sdf_clicked)
 
+        self.stop_button = QPushButton("STOP")
+        self.stop_button.setObjectName("stopButton")
+        self.stop_button.setEnabled(False)
+        self.stop_button.clicked.connect(self._on_stop_clicked)
+
         self.progress_bar = QProgressBar()
         self.progress_bar.setRange(0, 0)
         self.progress_bar.setVisible(False)
@@ -660,7 +759,22 @@ class MainWindow(QMainWindow):
         row.addWidget(self.prepare_button)
         row.addWidget(self.run_mopac_button)
         row.addWidget(self.export_sdf_button)
+        row.addWidget(self.stop_button)
         row.addWidget(self.progress_bar, stretch=1)
+        return row
+
+    def _build_retry_row(self) -> QHBoxLayout:
+        """Retry Failed Jobs -- kept away from the main workflow row on
+        purpose, and placed right under Settings since it reads the retry
+        timeout/keyword fields defined there.
+        """
+        row = QHBoxLayout()
+        row.addStretch(1)
+        self.retry_failed_button = QPushButton("Retry Failed Jobs")
+        self.retry_failed_button.setObjectName("primaryButton")
+        self.retry_failed_button.clicked.connect(self._on_retry_failed_clicked)
+        row.addWidget(self.retry_failed_button)
+        row.addStretch(1)
         return row
 
     def _attach_logging(self) -> None:
@@ -723,6 +837,8 @@ class MainWindow(QMainWindow):
         self.input_path_label.setText(path)
         self._prepare_succeeded = False
         self._mopac_succeeded = False
+        self._last_prepare_df = None
+        self._last_batch_df = None
 
         self.smiles_col_combo.clear()
         self.smiles_col_combo.addItems([str(c) for c in df.columns])
@@ -742,6 +858,8 @@ class MainWindow(QMainWindow):
     def _on_workdir_changed(self, _text: str) -> None:
         self._prepare_succeeded = False
         self._mopac_succeeded = False
+        self._last_prepare_df = None
+        self._last_batch_df = None
         self._update_button_states()
 
     def _on_browse_catalogue(self) -> None:
@@ -771,8 +889,12 @@ class MainWindow(QMainWindow):
             self.prepare_workers_spin,
             self.mopac_workers_spin,
             self.export_workers_spin,
+            self.obabel_timeout_spin,
             self.mopac_timeout_spin,
             self.export_timeout_spin,
+            self.retry_obabel_timeout_spin,
+            self.retry_mopac_timeout_spin,
+            self.retry_keywords_edit,
             self.copy_sdf_check,
         ]
         for widget in widgets:
@@ -834,6 +956,7 @@ class MainWindow(QMainWindow):
             auto_charge=self.auto_charge_check.isChecked(),
             overwrite=self.overwrite_check.isChecked(),
             max_workers=self.prepare_workers_spin.value(),
+            obabel_timeout=self.obabel_timeout_spin.value(),
         )
         self._start_phase(prepare_batch, kwargs, "Prepare")
 
@@ -862,16 +985,66 @@ class MainWindow(QMainWindow):
         export_func = functools.partial(_export_sdf_and_copy, copy_to)
         self._start_phase(export_func, kwargs, "Export SDF")
 
+    def _on_retry_failed_clicked(self) -> None:
+        if self.df is None:
+            QMessageBox.warning(self, "No input file", "Load an input file first.")
+            return
+        smiles_col = self.smiles_col_combo.currentText()
+        if not smiles_col:
+            QMessageBox.warning(self, "No SMILES column", "Choose a SMILES column first.")
+            return
+        id_col = self.id_col_combo.currentData()
+        retry_keywords = self.retry_keywords_edit.text().strip() or None
+
+        kwargs = dict(
+            df=self.df,
+            smiles_col=smiles_col,
+            id_col=id_col,
+            keywords=self.keywords_edit.text(),
+            workdir=self.workdir_edit.text(),
+            auto_charge=self.auto_charge_check.isChecked(),
+            obabel_timeout=self.retry_obabel_timeout_spin.value(),
+            mopac_timeout=self.retry_mopac_timeout_spin.value(),
+            retry_keywords=retry_keywords,
+            max_workers=self.mopac_workers_spin.value(),
+        )
+        self._start_phase(retry_failed_batch, kwargs, "Retry Failed")
+
+    def _on_stop_clicked(self) -> None:
+        """Ask the running phase to stop immediately.
+
+        Sets the shared cancel_event, which every mopac_batch_runner batch
+        function polls -- any obabel/MOPAC process currently running is
+        killed within about one poll interval (see run_command's docstring
+        in mopac_batch_runner.py), and no further compounds are started.
+        The phase's own worker thread notices it finished (whether by
+        completion or cancellation) via the normal _poll_worker path.
+        """
+        if not self._phase_running:
+            return
+        self._cancel_event.set()
+        self.stop_button.setEnabled(False)
+        self.stop_button.setText("Stopping...")
+        _runner_logger.info("Stop requested by user -- killing the current job(s).")
+
     # ------------------------------------------------------------------
     # Button gating
     # ------------------------------------------------------------------
     def _set_phase_buttons_enabled(self, running: bool) -> None:
         """running=True while a phase is active; False once it finishes."""
         self._phase_running = running
+        if not running:
+            self.stop_button.setText("STOP")
         self._update_button_states()
 
+    @staticmethod
+    def _has_failures(df: pd.DataFrame | None) -> bool:
+        if df is None or df.empty or "status" not in df.columns:
+            return False
+        return bool(df["status"].isin(["failed", "timeout", "cancelled"]).any())
+
     def _update_button_states(self) -> None:
-        """Sole place that computes final enabled/disabled for the 3 phase buttons."""
+        """Sole place that computes final enabled/disabled for the phase buttons."""
         can_prepare = (
             self.df is not None
             and bool(self.smiles_col_combo.currentText())
@@ -880,11 +1053,20 @@ class MainWindow(QMainWindow):
         self.prepare_button.setEnabled(can_prepare and not self._phase_running)
         self.run_mopac_button.setEnabled(self._prepare_succeeded and not self._phase_running)
         self.export_sdf_button.setEnabled(self._mopac_succeeded and not self._phase_running)
+        self.stop_button.setEnabled(self._phase_running)
+
+        can_retry = self._mopac_succeeded and (
+            self._has_failures(self._last_prepare_df) or self._has_failures(self._last_batch_df)
+        )
+        self.retry_failed_button.setEnabled(can_retry and not self._phase_running)
 
     # ------------------------------------------------------------------
     # Threaded phase execution
     # ------------------------------------------------------------------
     def _start_phase(self, func, kwargs: dict, phase_name: str) -> None:
+        self._cancel_event.clear()
+        kwargs = {**kwargs, "cancel_event": self._cancel_event}
+
         self._set_phase_buttons_enabled(True)
         self.progress_bar.setVisible(True)
         self._current_phase_name = phase_name
@@ -923,10 +1105,16 @@ class MainWindow(QMainWindow):
             # phase for the rows that did succeed.
             if self._current_phase_name == "Prepare":
                 self._prepare_succeeded = True
+                self._last_prepare_df = worker.result
             elif self._current_phase_name == "Run MOPAC":
                 self._mopac_succeeded = True
+                self._last_batch_df = worker.result
+            elif self._current_phase_name == "Retry Failed":
+                self._last_batch_df = worker.result
             self._populate_table(worker.result)
             self._update_summary_label(self._current_phase_name, worker.result)
+            if self._cancel_event.is_set():
+                self.summary_label.setText(self.summary_label.text() + "  (stopped by user)")
 
         self._set_phase_buttons_enabled(False)
 
@@ -941,16 +1129,20 @@ class MainWindow(QMainWindow):
 
         status_idx = list(df.columns).index("status") if "status" in df.columns else None
         fail_statuses = {"failed", "timeout"}
+        cancelled_color = QColor("#9AA0A2")  # matches disabled-widget grey elsewhere
+        failed_color = QColor("#FF5722")
 
         for row_idx, (_, row) in enumerate(df.iterrows()):
-            is_failed = (
-                status_idx is not None
-                and str(row.iloc[status_idx]).lower() in fail_statuses
-            )
+            row_status = str(row.iloc[status_idx]).lower() if status_idx is not None else ""
+            row_color = None
+            if row_status == "cancelled":
+                row_color = cancelled_color
+            elif row_status in fail_statuses:
+                row_color = failed_color
             for col_idx, value in enumerate(row):
                 item = QTableWidgetItem(str(value))
-                if is_failed:
-                    item.setForeground(QColor("#FF5722"))
+                if row_color is not None:
+                    item.setForeground(row_color)
                 self.results_table.setItem(row_idx, col_idx, item)
 
         self.results_table.resizeColumnsToContents()

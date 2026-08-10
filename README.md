@@ -4,7 +4,7 @@
 
 # SMILE and optimize
 
-**Created by Maciej Gromelski** · v1.0.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
+**Created by Maciej Gromelski** · v1.1.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
 
 Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**, available two ways:
 
@@ -19,6 +19,7 @@ The pipeline itself can be run as a **single combined call** or split into three
 | 2 | `run_mopac_batch` | Scans a directory for `.mop` files and submits each to MOPAC |
 | 3 | `export_sdf` | Converts optimised `.arc` files to `.sdf` via Open Babel |
 | Combined | `run_pipeline` | Phases 1 + 2 in a single call (SDF export always runs separately) |
+| Retry | `retry_failed_batch` | Re-runs only the compounds that failed/timed out in phases 1–2, with extended settings |
 
 ---
 
@@ -85,13 +86,14 @@ py gui.py
 
 1. **Load input data** — under *1. Input Data*, click *Browse…* and pick an `.xlsx` or `.csv` file containing your compounds, then choose which column holds the SMILES strings and (optionally) which holds the compound IDs.
 2. **Set the working directory** — where all generated files (`.mop`, `.out`, `.arc`, `.sdf`, per-phase result CSVs) get written. Defaults to `mopac_jobs`.
-3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, MOPAC/export timeouts, and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
+3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, Prepare/MOPAC/Export timeouts, retry-specific timeouts and an optional retry MOPAC keyword override (see *Retrying failed jobs* below), and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
 4. **Click SAVE SETTINGS** to lock the Settings section. This is a confirmation step (not a saved config file) — it prevents changing keywords/workers/timeouts by accident mid-run, and it's also what unlocks the *1. Prepare* button. Click *EDIT SETTINGS* to unlock and make changes again.
 5. **Run the three phases in order** — each button unlocks once the previous phase has completed:
    - **1. Prepare (SMILES → .mop)**
    - **2. Run MOPAC**
    - **3. Export SDF** (also copies to the SDF catalogue folder, if enabled)
 6. **Watch progress** on the right: a live results table (failed/timeout rows highlighted) refreshed after each phase, and a running log console.
+7. **Retry Failed Jobs** — once *2. Run MOPAC* has completed at least once, this button becomes enabled whenever any compound is still `failed`/`timeout`. It re-runs only those compounds (both Open-Babel-stage and MOPAC-stage failures) using the retry timeouts/keywords from Settings, then refreshes the table. Safe to click repeatedly — e.g. loosen the retry timeout further and click again if some jobs still don't converge.
 
 Phases are strictly sequential in the GUI — each must finish before the next unlocks. If you need to resume a `workdir` from a previous session without redoing earlier phases (e.g. jump straight to `run_mopac_batch` on an existing set of `.mop` files), use the Python API below instead.
 
@@ -188,6 +190,7 @@ prepare_batch(
     max_workers: int = 1,
     auto_charge: bool = False,
     coord_format: str = "mol2",
+    cancel_event: threading.Event | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -200,6 +203,7 @@ Converts SMILES strings to 3D coordinates (via Open Babel) and writes a MOPAC `.
 | `charge_col` | `str \| None` | `None` | Column with explicit integer charges. `CHARGE=n` is appended to keywords for non-zero values. |
 | `auto_charge` | `bool` | `False` | When `True` and `charge_col` is not set, the formal charge is computed from each SMILES using RDKit and added to the keywords as `CHARGE=n` for non-zero values. Requires RDKit (`pip install rdkit`). Ignored when `charge_col` is provided. |
 | `coord_format` | `str` | `"mol2"` | Intermediate 3D coordinate format written by Open Babel. One of `"mol2"`, `"sdf"`, or `"xyz"`. Change this if your Open Babel build does not support the default. |
+| `cancel_event` | `threading.Event \| None` | `None` | When set from another thread while this is running, any compound not yet started is skipped with `status="cancelled"` and the in-flight obabel process (if any) is killed immediately. See [Cancelling a running batch](#cancelling-a-running-batch). |
 
 **Returns**
 
@@ -209,7 +213,7 @@ A `DataFrame` with one row per input molecule, saved to `<workdir>/prepare_resul
 |---|---|
 | `compound_id` | Sanitised filesystem identifier. |
 | `smiles` | Original SMILES string. |
-| `status` | `ready`, `failed`, or `skipped`. |
+| `status` | `ready`, `failed`, `skipped`, or `cancelled`. |
 | `mop_file` | Absolute path to the `.mop` file, or `None`. |
 | `error_message` | Human-readable error description, or `None` on success. |
 | `duration_s` | Wall-clock time for the Open Babel step. |
@@ -230,6 +234,7 @@ run_mopac_batch(
     overwrite: bool = False,
     timeout: int | None = 600,
     max_workers: int = 1,
+    cancel_event: threading.Event | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -243,6 +248,7 @@ Scans `<workdir>/*/*.mop` for prepared input files and submits each to MOPAC. Th
 | `overwrite` | `bool` | `False` | Re-run even when a `.out` file already exists. |
 | `timeout` | `int \| None` | `600` | Per-compound MOPAC timeout in seconds. `None` = no limit. |
 | `max_workers` | `int` | `1` | Number of parallel worker threads. |
+| `cancel_event` | `threading.Event \| None` | `None` | When set from another thread while this is running, any compound not yet started is skipped with `status="cancelled"` and the in-flight MOPAC process(es) (if any) are killed immediately. See [Cancelling a running batch](#cancelling-a-running-batch). |
 
 **Returns**
 
@@ -252,7 +258,7 @@ A `DataFrame` with one row per `.mop` file found, saved to `<workdir>/batch_resu
 |---|---|
 | `compound_id` | Identifier read from the `.mop` file stem. |
 | `smiles` | Original SMILES extracted from the `.mop` header. |
-| `status` | `success`, `failed`, `skipped`, or `timeout`. |
+| `status` | `success`, `failed`, `skipped`, `timeout`, or `cancelled`. |
 | `mop_file` | Absolute path to the `.mop` input file. |
 | `out_file` | Absolute path to the `.out` output file, or `None`. |
 | `arc_file` | Absolute path to the `.arc` archive file, or `None`. |
@@ -285,12 +291,13 @@ run_pipeline(
     max_workers: int = 1,
     auto_charge: bool = False,
     coord_format: str = "mol2",
+    cancel_event: threading.Event | None = None,
 ) -> pd.DataFrame
 ```
 
 Runs both phases (Open Babel + MOPAC) in a single call. Equivalent to `prepare_batch` followed by `run_mopac_batch`. Use this when you do not need to inspect or edit `.mop` files between phases.
 
-**Parameters** — same as `prepare_batch`, with the addition of `timeout` (MOPAC per-compound limit). `auto_charge` and `coord_format` behave identically to `prepare_batch`.
+**Parameters** — same as `prepare_batch`, with the addition of `timeout` (MOPAC per-compound limit). `auto_charge`, `coord_format`, and `cancel_event` behave identically to `prepare_batch`.
 
 **Returns** — same schema as `run_mopac_batch`, saved to `<workdir>/batch_results.csv`.
 
@@ -309,6 +316,7 @@ export_sdf(
     overwrite: bool = False,
     timeout: int = 60,
     max_workers: int = 1,
+    cancel_event: threading.Event | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -324,6 +332,7 @@ The geometry used is extracted from the `FINAL GEOMETRY OBTAINED` block at the e
 | `overwrite` | `bool` | `False` | Re-convert even when a `.sdf` file already exists. |
 | `timeout` | `int` | `60` | Per-compound obabel timeout in seconds. |
 | `max_workers` | `int` | `1` | Number of parallel worker threads. |
+| `cancel_event` | `threading.Event \| None` | `None` | When set from another thread while this is running, any compound not yet started is skipped with `status="cancelled"` and the in-flight obabel process (if any) is killed immediately. See [Cancelling a running batch](#cancelling-a-running-batch). |
 
 **Returns**
 
@@ -334,7 +343,7 @@ A `DataFrame` with one row per `.arc` file found, saved to `<workdir>/sdf_result
 | `compound_id` | Identifier from the `.arc` file stem. |
 | `arc_file` | Absolute path to the source `.arc` file. |
 | `sdf_file` | Absolute path to the produced `.sdf` file, or `None`. |
-| `status` | `success`, `failed`, or `skipped`. |
+| `status` | `success`, `failed`, `skipped`, or `cancelled`. |
 | `error_message` | Human-readable error description, or `None` on success. |
 | `duration_s` | Wall-clock time for the Open Babel conversion. |
 
@@ -342,6 +351,106 @@ A `DataFrame` with one row per `.arc` file found, saved to `<workdir>/sdf_result
 
 - `EnvironmentError` — if `obabel` is not found in PATH.
 - `FileNotFoundError` — if `workdir` does not exist.
+
+---
+
+#### `retry_failed_batch`
+
+```python
+retry_failed_batch(
+    df: pd.DataFrame,
+    smiles_col: str,
+    id_col: str | None = None,
+    keywords: str = "PM7 PRECISE GEO-OK",
+    workdir: str | Path = "mopac_jobs",
+    charge_col: str | None = None,
+    multiplicity_col: str | None = None,
+    auto_charge: bool = False,
+    coord_format: str = "mol2",
+    obabel_options: list[str] | None = None,
+    obabel_timeout: int = 240,
+    mopac_timeout: int | None = 1800,
+    retry_keywords: str | None = None,
+    max_workers: int = 1,
+    cancel_event: threading.Event | None = None,
+) -> pd.DataFrame
+```
+
+Re-runs only the compounds that failed, timed out, or were cancelled in a previous batch, using extended settings, and merges the outcomes back into `prepare_results.csv` / `batch_results.csv`. Compounds that already succeeded are left completely untouched.
+
+It reads `<workdir>/prepare_results.csv` to find compounds where Open Babel never produced a `.mop` file (`status` in `failed`/`cancelled`), and `<workdir>/batch_results.csv` to find compounds where MOPAC failed, timed out, or was cancelled (`status` in `failed`/`timeout`/`cancelled`). Each group is retried independently — Open Babel failures with *obabel_timeout*, MOPAC failures (plus any compound that just got a `.mop` file from the first retry) with *mopac_timeout*. This means a compound stopped via [`cancel_event`](#cancelling-a-running-batch) on an earlier run is retried exactly like a genuine failure or timeout.
+
+**Key parameters**
+
+| Parameter | Type | Default | Description |
+|---|---|---|---|
+| `df`, `smiles_col`, `id_col`, `keywords`, `charge_col`, `multiplicity_col`, `auto_charge`, `coord_format` | — | — | Must match the values used for the **original** `prepare_batch` call. See warning below. |
+| `obabel_timeout` | `int` | `240` | Per-compound Open Babel timeout for the retry pass. |
+| `mopac_timeout` | `int \| None` | `1800` | Per-compound MOPAC timeout for the retry pass. |
+| `retry_keywords` | `str \| None` | `None` | When given, used instead of `keywords` for every retried compound (e.g. to relax convergence criteria). `None` reuses `keywords` unchanged. |
+| `cancel_event` | `threading.Event \| None` | `None` | Same as on `prepare_batch`/`run_mopac_batch` — cancels the retry pass itself. See [Cancelling a running batch](#cancelling-a-running-batch). |
+
+> **Warning:** `df` must be the exact same DataFrame (same rows, same order) passed to the original `prepare_batch` call. Compound-ID assignment — auto-generated sequential IDs (`mol_000007`, …) and duplicate-ID suffixing — depends on enumerating the *full* DataFrame in its original order. Passing a filtered or reordered DataFrame will not line up with the existing job directories and their prior results.
+
+**Returns**
+
+The updated `batch_results.csv` DataFrame (same schema as `run_mopac_batch`), covering **all** compounds, not just the retried ones. Also saved back to `<workdir>/batch_results.csv` (and `<workdir>/prepare_results.csv` is updated in place too).
+
+**Raises**
+
+- `EnvironmentError` — if `obabel` or `mopac` is not found in PATH.
+- `FileNotFoundError` — if `workdir` does not exist.
+- `KeyError` — if a referenced column is absent from `df`.
+
+**Example**
+
+```python
+from mopac_batch_runner import prepare_batch, run_mopac_batch, retry_failed_batch
+
+prep = prepare_batch(df=df, smiles_col="smiles", id_col="compound_id", workdir="mopac_jobs")
+results = run_mopac_batch(workdir="mopac_jobs", timeout=600)
+
+# Some compounds timed out at 600s -- retry just those with a much longer
+# timeout and a slightly relaxed keyword line.
+retried = retry_failed_batch(
+    df=df,
+    smiles_col="smiles",
+    id_col="compound_id",
+    workdir="mopac_jobs",
+    mopac_timeout=3600,
+    retry_keywords="PM7 PRECISE GEO-OK GNORM=1.0",
+)
+print(retried[["compound_id", "status", "duration_s"]])
+```
+
+---
+
+### Cancelling a running batch
+
+Every batch-level function (`prepare_batch`, `run_mopac_batch`, `run_pipeline`, `export_sdf`, `retry_failed_batch`) accepts an optional `cancel_event: threading.Event | None`. Setting it **from another thread** while a batch is running kills whatever obabel/MOPAC process is currently in flight within a fraction of a second, and skips every compound that hasn't started yet — instead of waiting for the current job to finish naturally or hit its own `timeout`.
+
+This only matters when you're driving the pipeline from a background thread (e.g. a GUI, as `gui.py` does for its STOP button) so that setting the event from the main thread can actually interrupt a call that's blocking elsewhere:
+
+```python
+import threading
+from mopac_batch_runner import run_mopac_batch
+
+cancel_event = threading.Event()
+
+def run():
+    run_mopac_batch(workdir="mopac_jobs", timeout=1800, cancel_event=cancel_event)
+
+t = threading.Thread(target=run)
+t.start()
+
+# ... later, from the main thread (or another thread) ...
+cancel_event.set()   # kills the in-flight MOPAC process(es) immediately
+t.join()
+```
+
+Compounds that were still queued or running when `cancel_event` was set come back with `status="cancelled"` in the returned DataFrame/CSV, distinct from `"failed"` and `"timeout"`. `retry_failed_batch` treats `"cancelled"` exactly like a failure or timeout, so stopping a batch partway through and retrying afterward compose naturally — see [`retry_failed_batch`](#retry_failed_batch) above.
+
+If you call these functions directly on the main thread with no `cancel_event`, nothing changes — this is purely opt-in.
 
 ---
 
@@ -676,6 +785,26 @@ The GUI attaches its own log handler to this same logger and streams everything 
 - **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `prepare_results.csv` to see which attempt failed and why.
 - **`run_mopac_batch` discovers `.mop` files alphabetically** — the row order in `batch_results.csv` reflects filesystem sort order, not the original DataFrame order. Join on `compound_id` if you need to align with the input.
 - **GUI phases are strictly sequential** — unlike the library (which lets you call `run_mopac_batch`/`export_sdf` independently against an existing `workdir`), the GUI requires each phase button to unlock in order within a session. Use the Python API for cross-session resumability.
+- **`retry_failed_batch` requires the original DataFrame, unmodified** — it reconstructs compound IDs by re-running the same ID-assignment logic as `prepare_batch` over the full `df`. If you used auto-generated sequential IDs (no `id_col`) and pass a different or reordered DataFrame on retry, compounds will be matched to the wrong directories. Always keep the original `df` around for the lifetime of a `workdir`.
+- **`cancel_event` kills the whole obabel/MOPAC process, not a sub-step within it** — cancellation is implemented by terminating the child process (`Popen.kill()`), which assumes obabel/MOPAC don't spawn their own detached child processes of their own (they don't, in normal use). A killed MOPAC job leaves behind whatever partial `.out` file it had written; the next `overwrite=True` run (including `retry_failed_batch`) simply overwrites it, same as an ordinary timeout.
+
+---
+
+## Changelog
+
+### v1.1.0
+
+- **Retry failed/timed-out jobs** — new `retry_failed_batch()` function (library) and **Retry Failed Jobs** button (GUI). Re-runs only the compounds that failed, timed out, or were cancelled in a previous batch — with extended timeouts and an optional MOPAC keyword override — and merges the outcomes back into the existing result CSVs. See [`retry_failed_batch`](#retry_failed_batch).
+- **Stop a running batch** — new **STOP** button in the GUI, backed by a `cancel_event: threading.Event` parameter on every batch function (`prepare_batch`, `run_mopac_batch`, `run_pipeline`, `export_sdf`, `retry_failed_batch`). Kills the in-flight obabel/MOPAC process immediately (within a fraction of a second) instead of waiting for it to finish or time out. See [Cancelling a running batch](#cancelling-a-running-batch).
+- **New `"cancelled"` status** — compounds interrupted by STOP get this status (distinct from `"failed"`/`"timeout"`) and are automatically picked up by a subsequent Retry Failed Jobs run.
+- **Prepare (obabel) timeout is now configurable in the GUI** — previously silently fixed at 120s with no UI control.
+- **Clearer batch-completion log messages** — the "finished" log line for each phase now reports a per-status breakdown and explicitly notes `(stopped by user)` when STOP was used, instead of a bare compound count that looked identical whether the run completed cleanly or was interrupted.
+- **GUI layout** — the three workflow buttons (`1. Prepare`, `2. Run MOPAC`, `3. Export SDF`) plus STOP and the progress bar moved to the top of the results side (right column), above the results table and log console. **Retry Failed Jobs** moved to the left column, under Settings, next to the retry timeout/keyword fields it reads from.
+- **Footer provenance** — author, version, copyright year, and contact email are now loaded from [`provenance.json`](provenance.json) at startup instead of being hardcoded in `gui.py`.
+
+### v1.0.0
+
+Initial release: three-phase pipeline (`prepare_batch` → `run_mopac_batch` → `export_sdf`), combined `run_pipeline`, desktop GUI, RDKit-based `auto_charge`, obabel 3D-generation fallback chain, and parallel execution via `max_workers`.
 
 ---
 
