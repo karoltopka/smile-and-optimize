@@ -1,8 +1,17 @@
-# mopac_batch_runner
+<p align="center">
+  <img src="assets/logo2.png" alt="SMILE and optimize" width="640">
+</p>
 
-Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**.
+# SMILE and optimize
 
-The pipeline can be run as a **single combined call** or split into three independent phases:
+**Created by Maciej Gromelski** · v1.0.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
+
+Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**, available two ways:
+
+- **Desktop GUI** (`gui.py`, "SMILE and optimize") — a point-and-click PySide6 app: load a spreadsheet of SMILES, configure the run, and step through Prepare → Run MOPAC → Export SDF while watching live results and logs.
+- **Python API** (`mopac_batch_runner.py`) — call the same pipeline programmatically from a script or Jupyter notebook.
+
+The pipeline itself can be run as a **single combined call** or split into three independent phases:
 
 | Phase | Function | What it does |
 |---|---|---|
@@ -17,8 +26,16 @@ The pipeline can be run as a **single combined call** or split into three indepe
 
 ### Python
 
-- Python 3.9 or later
-- `pandas`
+- Python 3.9 or later (the GUI has been tested on 3.14)
+- Install everything via:
+
+```
+pip install -r requirements.txt
+```
+
+This installs `pandas` and `numpy` (data handling), `openpyxl` (Excel/CSV I/O), `PySide6` (the desktop GUI), and `rdkit` (optional automatic charge detection — used by `auto_charge=True` in the API and the GUI's "Auto-detect charge" checkbox).
+
+If you only need the library and not the GUI or `auto_charge`, the minimal requirement is just `pandas`:
 
 ```
 pip install pandas
@@ -40,17 +57,53 @@ obabel --version
 mopac --version
 ```
 
+The GUI also checks this for you at launch (and via its *Check environment* button).
+
 ---
 
 ## Installation
 
-Copy `mopac_batch_runner.py` into your project directory. No package installation is required beyond `pandas`.
+Clone or copy this repository, then install dependencies:
+
+```
+pip install -r requirements.txt
+```
+
+If you only want the library (`mopac_batch_runner.py`) and not the GUI, you can instead just copy that single file into your project — no package installation is required beyond `pandas`.
 
 ---
 
-## Quick start
+## Desktop GUI
 
-### Three-phase workflow (recommended)
+Launch it with:
+
+```
+py gui.py
+```
+
+### Workflow
+
+1. **Load input data** — under *1. Input Data*, click *Browse…* and pick an `.xlsx` or `.csv` file containing your compounds, then choose which column holds the SMILES strings and (optionally) which holds the compound IDs.
+2. **Set the working directory** — where all generated files (`.mop`, `.out`, `.arc`, `.sdf`, per-phase result CSVs) get written. Defaults to `mopac_jobs`.
+3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, MOPAC/export timeouts, and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
+4. **Click SAVE SETTINGS** to lock the Settings section. This is a confirmation step (not a saved config file) — it prevents changing keywords/workers/timeouts by accident mid-run, and it's also what unlocks the *1. Prepare* button. Click *EDIT SETTINGS* to unlock and make changes again.
+5. **Run the three phases in order** — each button unlocks once the previous phase has completed:
+   - **1. Prepare (SMILES → .mop)**
+   - **2. Run MOPAC**
+   - **3. Export SDF** (also copies to the SDF catalogue folder, if enabled)
+6. **Watch progress** on the right: a live results table (failed/timeout rows highlighted) refreshed after each phase, and a running log console.
+
+Phases are strictly sequential in the GUI — each must finish before the next unlocks. If you need to resume a `workdir` from a previous session without redoing earlier phases (e.g. jump straight to `run_mopac_batch` on an existing set of `.mop` files), use the Python API below instead.
+
+---
+
+## Python API
+
+The sections below describe `mopac_batch_runner.py`'s functions directly, for use in your own scripts or Jupyter notebooks. The GUI above wraps exactly these same functions.
+
+### Quick start
+
+#### Three-phase workflow (recommended)
 
 ```python
 import pandas as pd
@@ -90,7 +143,7 @@ sdf = export_sdf(workdir="mopac_jobs", overwrite=True)
 print(sdf[["compound_id", "status", "sdf_file"]])
 ```
 
-### Combined single-call workflow
+#### Combined single-call workflow
 
 ```python
 from mopac_batch_runner import run_pipeline
@@ -116,9 +169,9 @@ py mopac_batch_runner.py
 
 ---
 
-## Function reference
+### Function reference
 
-### `prepare_batch`
+#### `prepare_batch`
 
 ```python
 prepare_batch(
@@ -169,7 +222,7 @@ A `DataFrame` with one row per input molecule, saved to `<workdir>/prepare_resul
 
 ---
 
-### `run_mopac_batch`
+#### `run_mopac_batch`
 
 ```python
 run_mopac_batch(
@@ -214,7 +267,7 @@ A `DataFrame` with one row per `.mop` file found, saved to `<workdir>/batch_resu
 
 ---
 
-### `run_pipeline`
+#### `run_pipeline`
 
 ```python
 run_pipeline(
@@ -248,7 +301,7 @@ Runs both phases (Open Babel + MOPAC) in a single call. Equivalent to `prepare_b
 
 ---
 
-### `export_sdf`
+#### `export_sdf`
 
 ```python
 export_sdf(
@@ -292,7 +345,7 @@ A `DataFrame` with one row per `.arc` file found, saved to `<workdir>/sdf_result
 
 ---
 
-## Output directory structure
+### Output directory structure
 
 ```
 mopac_jobs/
@@ -317,7 +370,7 @@ mopac_jobs/
 
 ---
 
-## MOPAC input file format
+### MOPAC input file format
 
 The `.mop` file written by this script follows the format required by MOPAC:
 
@@ -339,7 +392,7 @@ O      3.08132000  1    -0.41155000  1     1.21850000  1
 
 ---
 
-## Common keywords
+### Common keywords
 
 | Keyword | Effect |
 |---|---|
@@ -354,9 +407,9 @@ O      3.08132000  1    -0.41155000  1     1.21850000  1
 
 ---
 
-## Handling charged and open-shell molecules
+### Handling charged and open-shell molecules
 
-### Explicit charge column
+#### Explicit charge column
 
 Pass a column containing formal integer charges:
 
@@ -380,10 +433,10 @@ prep = prepare_batch(
 results = run_mopac_batch(workdir="mopac_jobs")
 ```
 
-The generated keywords line for phenolate will be `PM7 PRECISE CHARGE=-1`.  
+The generated keywords line for phenolate will be `PM7 PRECISE CHARGE=-1`.
 The generated keywords line for triplet O2 will be `PM7 PRECISE TRIPLET`.
 
-### Automatic charge detection
+#### Automatic charge detection
 
 When charge information is not available in the dataset, set `auto_charge=True` to have the formal charge computed directly from each SMILES using RDKit:
 
@@ -405,6 +458,8 @@ Row 7: auto_charge detected charge=+1.
 
 `auto_charge` is ignored when `charge_col` is provided — the explicit column always takes precedence. RDKit must be installed (`pip install rdkit`).
 
+> **Note:** `auto_charge` (and RDKit in general) requires the ionic center in the SMILES to carry an explicit formal-charge sign (e.g. `[N+]`, `[O-]`) — a SMILES missing that sign will either fail to parse ("Explicit valence ... greater than permitted") or silently parse as a neutral radical instead of the intended ion. If you're working with a library of pre-formed ions (e.g. ionic liquid cations/anions) and see either symptom, check that every charged atom's bracket actually includes its `+`/`-`.
+
 Supported multiplicities and their MOPAC keywords:
 
 | Multiplicity (2S+1) | Keyword added |
@@ -418,7 +473,7 @@ Supported multiplicities and their MOPAC keywords:
 
 ---
 
-## Skipping already-completed jobs
+### Skipping already-completed jobs
 
 Each phase has its own skip logic, both controlled by `overwrite`.
 
@@ -447,7 +502,7 @@ results = run_mopac_batch(workdir="mopac_jobs", overwrite=True)
 
 ---
 
-## 3D coordinate format
+### 3D coordinate format
 
 Open Babel is used to convert SMILES to a 3D coordinate file before writing the MOPAC input. The format of this intermediate file is controlled by the `coord_format` parameter (and the `OBABEL_3D_FORMAT` constant at the top of the module).
 
@@ -477,7 +532,7 @@ OBABEL_3D_FORMAT: str = "sdf"   # or "xyz" if your build supports it
 
 ---
 
-## 3D generation fallback
+### 3D generation fallback
 
 Open Babel 3.1.1 contains a bug where the default `--gen3d` algorithm (`best`) looks up fragment coordinates from `rigid-fragments.txt` and **segfaults** when a fragment is absent from the database. Common triggers include fluoroanilines, fluoropyrimidines, chloroanilines, and certain aliphatic fluorinated rings.
 
@@ -514,7 +569,7 @@ To change the fallback chain globally, edit `OBABEL_FALLBACK_OPTIONS` at the top
 
 ---
 
-## Parallel execution
+### Parallel execution
 
 Both `prepare_batch` and `run_mopac_batch` accept a `max_workers` parameter to run jobs simultaneously. Each job writes to its own subdirectory so there are no filesystem conflicts. The returned DataFrame always preserves the input row order (for `prepare_batch`) or file-discovery order (for `run_mopac_batch`) regardless of completion order.
 
@@ -561,7 +616,7 @@ Parallel prepare: 5 jobs across 3 workers.
 
 ---
 
-## Reading results after the batch
+### Reading results after the batch
 
 ```python
 import pandas as pd
@@ -595,7 +650,7 @@ obabel aspirin.arc -oxyz -O aspirin_opt.xyz
 
 ---
 
-## Logging
+### Logging
 
 The module uses Python's standard `logging` module under the logger name `mopac_batch_runner`. Enable it in your script:
 
@@ -609,12 +664,23 @@ logging.basicConfig(
 
 Set `level=logging.DEBUG` to see every subprocess command that is executed, including which obabel fallback attempt is being tried.
 
+The GUI attaches its own log handler to this same logger and streams everything into its on-screen log console, so this applies whether you're driving the pipeline from a script or from `gui.py`.
+
 ---
 
-## Known limitations
+### Known limitations
 
 - **Windows only** — tested on Windows 11 with MOPAC 23.2.1 and Open Babel 3.1.0–3.1.1. The code uses `pathlib` and list-based `subprocess` calls so it should be portable, but is untested on Linux/macOS.
 - **XYZ format not available in all Open Babel builds** — some installers (including certain 3.1.0 Windows builds) omit the XYZ output format. The pipeline defaults to MOL2 to avoid this. If you see `obabel: cannot write output format!` in `obabel.log`, confirm your format with `obabel -L formats` and pass `coord_format="mol2"` (or `"sdf"`) explicitly.
 - **MOPAC keyword line length** — MOPAC has an 80-character limit per keyword line. Long auto-generated keyword strings (charge + high spin multiplicity) may need manual splitting.
 - **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `prepare_results.csv` to see which attempt failed and why.
 - **`run_mopac_batch` discovers `.mop` files alphabetically** — the row order in `batch_results.csv` reflects filesystem sort order, not the original DataFrame order. Join on `compound_id` if you need to align with the input.
+- **GUI phases are strictly sequential** — unlike the library (which lets you call `run_mopac_batch`/`export_sdf` independently against an existing `workdir`), the GUI requires each phase button to unlock in order within a session. Use the Python API for cross-session resumability.
+
+---
+
+## License
+
+This project is licensed under the **[PolyForm Noncommercial License 1.0.0](LICENSE)**.
+
+In short: you're free to use, modify, and redistribute this software for **any noncommercial purpose** — academic research, education, personal projects, nonprofit and government use — at no cost. **Commercial use of any kind is not permitted** without a separate license from the author. See the [LICENSE](LICENSE) file for the full legal text.
