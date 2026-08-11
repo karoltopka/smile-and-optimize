@@ -786,11 +786,22 @@ The GUI attaches its own log handler to this same logger and streams everything 
 - **`run_mopac_batch` discovers `.mop` files alphabetically** — the row order in `batch_results.csv` reflects filesystem sort order, not the original DataFrame order. Join on `compound_id` if you need to align with the input.
 - **GUI phases are strictly sequential** — unlike the library (which lets you call `run_mopac_batch`/`export_sdf` independently against an existing `workdir`), the GUI requires each phase button to unlock in order within a session. Use the Python API for cross-session resumability.
 - **`retry_failed_batch` requires the original DataFrame, unmodified** — it reconstructs compound IDs by re-running the same ID-assignment logic as `prepare_batch` over the full `df`. If you used auto-generated sequential IDs (no `id_col`) and pass a different or reordered DataFrame on retry, compounds will be matched to the wrong directories. Always keep the original `df` around for the lifetime of a `workdir`.
-- **`cancel_event` kills the whole obabel/MOPAC process, not a sub-step within it** — cancellation is implemented by terminating the child process (`Popen.kill()`), which assumes obabel/MOPAC don't spawn their own detached child processes of their own (they don't, in normal use). A killed MOPAC job leaves behind whatever partial `.out` file it had written; the next `overwrite=True` run (including `retry_failed_batch`) simply overwrites it, same as an ordinary timeout.
+- **`cancel_event` kills the whole obabel/MOPAC process, not a sub-step within it** — cancellation terminates the child process tree, so a partially-completed optimisation cannot be resumed from where it stopped. A killed MOPAC job leaves behind whatever partial `.out` file it had written; the next `overwrite=True` run (including `retry_failed_batch`) simply overwrites it, same as an ordinary timeout.
+- **A wedged external process leaks two reader threads** — if obabel or MOPAC survives a process-tree kill *and* something still holds its output pipes open, the pipes are abandoned so the batch can continue. This leaks the pair of daemon threads `subprocess` uses to read them, for the remaining life of the process. It is bounded and rare (once per wedged job), and preferable to the alternative, which was hanging the batch.
 
 ---
 
 ## Changelog
+
+### v1.2.0
+
+- **Fixed: one bad molecule could hang an entire batch and discard every result.** A compound whose obabel process survived being killed — because its output pipe handles had been inherited by another process — left the worker thread blocked forever in an unbounded `communicate()`. Since results were only written after the *last* job returned, a 5,590-compound run produced 5,582 `.mop` files and no `prepare_results.csv` at all. Four independent changes now make that impossible:
+  - **Bounded process teardown** — killing a child is capped at ~5s and kills the whole process tree first (killing the direct child alone orphans anything it spawned, putting it out of reach). If the pipes are still held after that they are abandoned rather than waited on, so `run_command` always returns.
+  - **Per-compound time budget** — new `molecule_timeout` parameter on `prepare_batch` and `prepare_one_molecule` caps the *sum* of all obabel fallback attempts, not just each one individually. Defaults to `obabel_timeout * attempts + 30`.
+  - **Incremental result CSVs** — every phase now rewrites its results CSV every 200 completed jobs (atomically, via a temp file), so an interrupted or wedged run keeps everything finished up to that point instead of losing all of it.
+  - **Stall detection** — batches now watch the gap *between* completions rather than waiting indefinitely for stragglers. If no job finishes for the per-job timeout plus a 5-minute grace period, the outstanding jobs are recorded as `failed` and the batch returns. Every submitted compound still gets exactly one row in the results.
+- **Fixed: closing the GUI window did not end the process.** The batch worker ran inside a `ThreadPoolExecutor`, whose threads are joined by an `atexit` hook — so a single stuck worker kept the app alive after the window was gone and it had to be killed from the terminal. Closing now cancels the running phase and force-exits after a 10-second grace period.
+- **Known limitation retired** — the `cancel_event` note about child processes not spawning their own children no longer applies; cancellation and timeouts now kill the full process tree.
 
 ### v1.1.0
 

@@ -67,7 +67,7 @@ PROVENANCE_PATH = Path(__file__).resolve().parent / "provenance.json"
 # malformed so a broken/deleted provenance file can't stop the app launching.
 _DEFAULT_PROVENANCE = {
     "author": "Maciej Gromelski",
-    "version": "1.1.0",
+    "version": "1.2.0",
     "year": 2026,
     "contact_email": "maciek.gromelski@gmail.com",
 }
