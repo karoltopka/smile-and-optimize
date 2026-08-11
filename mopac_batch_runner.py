@@ -35,15 +35,17 @@ Typical usage::
 from __future__ import annotations
 
 import logging
+import os
 import re
 import shutil
 import subprocess
 import threading
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import pandas as pd
 
@@ -81,6 +83,13 @@ OBABEL_FALLBACK_OPTIONS: list[list[str]] = [
     ["--gen3d", "dist"],
     ["--gen3d", "dist", "--minimize", "--ff", "UFF", "--steps", "500"],
 ]
+
+# Extra seconds allowed on top of `obabel_timeout * number of attempts` before
+# a compound is abandoned outright.  `obabel_timeout` bounds one obabel call;
+# this bounds the whole compound, including the parsing and validation between
+# attempts, so a pathological structure cannot occupy a worker indefinitely
+# however it misbehaves.
+_MOLECULE_TIMEOUT_SLACK: float = 30.0
 
 # Coordinates whose absolute value exceeds this threshold (Å) are physically
 # impossible and indicate a 3D-generation artefact (XYZ column overflow, etc.).
@@ -296,6 +305,89 @@ def sanitize_id(raw_id: str) -> str:
 # process within a fraction of a second; long enough not to busy-loop.
 _POLL_INTERVAL: float = 0.2
 
+# Upper bound on how long we wait to collect a child's remaining stdout/stderr
+# after killing it.  A killed process normally closes its pipes immediately,
+# but if the write ends were inherited by another process — a crash handler
+# such as WerFault.exe, an on-access virus scanner, or a grandchild — they can
+# stay open indefinitely.  An unbounded ``communicate()`` there blocks the
+# worker thread forever, which is what stranded a 5,590-molecule prepare run on
+# a single compound.
+_KILL_DRAIN_TIMEOUT: float = 5.0
+
+
+def _drain_pipes(
+    proc: "subprocess.Popen[str]", timeout: float,
+) -> Optional[tuple[str, str]]:
+    """Collect a child's remaining output, giving up after *timeout* seconds.
+
+    Returns ``None`` when the pipes could not be drained in time — meaning the
+    child, or some other process holding its inherited pipe handles, is still
+    alive.
+    """
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+        return stdout or "", stderr or ""
+    except subprocess.TimeoutExpired:
+        return None
+    except (OSError, ValueError) as exc:
+        logger.debug("Draining pid %s failed: %s", proc.pid, exc)
+        return "", ""
+
+
+def _kill_process_tree(pid: int) -> None:
+    """Force-kill *pid* and every process it spawned.
+
+    Only meaningful on Windows: :meth:`Popen.kill` there is a plain
+    ``TerminateProcess`` on the direct child, so anything it started (and
+    anything holding a duplicate of its pipe handles) survives.  On POSIX the
+    ``SIGKILL`` that :meth:`Popen.kill` sends cannot be caught or ignored, so
+    no escalation is available or needed for the child itself.
+    """
+    if os.name != "nt":
+        return
+    try:
+        subprocess.run(
+            ["taskkill", "/T", "/F", "/PID", str(pid)],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            timeout=_KILL_DRAIN_TIMEOUT,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        logger.debug("taskkill for pid %s failed: %s", pid, exc)
+
+
+def _kill_and_drain(proc: "subprocess.Popen[str]") -> tuple[str, str]:
+    """Terminate *proc* and return its output, never blocking indefinitely.
+
+    The tree kill goes *first*, because killing the direct child on its own
+    orphans anything it spawned — and an orphan holding a duplicate of the
+    child's pipe handles is precisely what leaves ``communicate()`` waiting on
+    an EOF that never comes.  Once the child is dead its tree can no longer be
+    walked by PID, so escalating afterwards would be too late.
+
+    If the pipes are *still* open after that, they are abandoned.  That leaks
+    the two daemon reader threads :mod:`subprocess` uses and their handles — a
+    bounded, one-off cost per wedged process, against blocking here, which
+    costs the entire batch.
+    """
+    _kill_process_tree(proc.pid)
+    try:
+        proc.kill()
+    except OSError as exc:  # already reaped, or denied
+        logger.debug("kill() failed for pid %s: %s", proc.pid, exc)
+
+    drained = _drain_pipes(proc, _KILL_DRAIN_TIMEOUT)
+    if drained is not None:
+        return drained
+
+    logger.error(
+        "pid %s was killed but its output pipes are still held open after "
+        "%.0fs; abandoning them so the batch can continue.",
+        proc.pid, _KILL_DRAIN_TIMEOUT,
+    )
+    return "", ""
+
 
 def run_command(
     cmd: list[str],
@@ -316,6 +408,11 @@ def run_command(
     This lets *cancel_event* be honoured promptly: setting it from another
     thread kills the child process within about one poll interval, rather
     than waiting for it to finish on its own or hit *timeout*.
+
+    Tearing the child down is itself bounded (see :func:`_kill_and_drain`), so
+    this function always returns: a child that ignores its death sentence, or
+    whose pipe handles were inherited by another process, is abandoned rather
+    than waited on.
 
     Args:
         cmd:          Command and arguments as a list.
@@ -357,15 +454,13 @@ def run_command(
         except subprocess.TimeoutExpired:
             if cancel_event is not None and cancel_event.is_set():
                 cancelled = True
-                proc.kill()
-                stdout, stderr = proc.communicate()
-                returncode = proc.returncode
+                stdout, stderr = _kill_and_drain(proc)
+                returncode = proc.returncode if proc.returncode is not None else -1
                 break
             if timeout is not None and (time.monotonic() - start) >= timeout:
                 timed_out = True
-                proc.kill()
-                stdout, stderr = proc.communicate()
-                returncode = proc.returncode
+                stdout, stderr = _kill_and_drain(proc)
+                returncode = proc.returncode if proc.returncode is not None else -1
                 break
 
     stdout = stdout or ""
@@ -1019,6 +1114,7 @@ def prepare_one_molecule(
     obabel_options: Optional[list[str]] = None,
     coord_format: str = OBABEL_3D_FORMAT,
     cancel_event: Optional[threading.Event] = None,
+    molecule_timeout: Optional[float] = None,
 ) -> PrepResult:
     """Run phase 1 of the pipeline for one compound: SMILES → .mop file.
 
@@ -1045,6 +1141,12 @@ def prepare_one_molecule(
                          spawning obabel. When set while obabel is running,
                          the process is killed immediately and no further
                          fallback attempts are tried.
+        molecule_timeout: Hard wall-clock cap (s) for this compound across
+                         *all* obabel attempts.  ``obabel_timeout`` bounds a
+                         single obabel call; this bounds their sum, so the
+                         worker is guaranteed back even if every fallback runs
+                         long.  Defaults to
+                         ``obabel_timeout * attempts + 30``.
 
     Returns:
         :class:`PrepResult` with ``status`` ``"ready"``, ``"failed"``,
@@ -1083,11 +1185,26 @@ def prepare_one_molecule(
     primary = obabel_options if obabel_options is not None else list(OBABEL_DEFAULT_OPTIONS)
     option_sets = [primary] + OBABEL_FALLBACK_OPTIONS
 
+    if molecule_timeout is None:
+        molecule_timeout = obabel_timeout * len(option_sets) + _MOLECULE_TIMEOUT_SLACK
+
     coord_file = job.job_dir / f"structure.{coord_format}"
     atoms: list[XYZAtom] = []
     attempt_error = "No obabel attempt was made."
 
     for attempt, opts in enumerate(option_sets, start=1):
+        # Each attempt gets the full obabel_timeout, but never more than what
+        # is left of the compound's overall budget, so the attempts cannot add
+        # up to an unbounded stay on this worker thread.
+        remaining = molecule_timeout - (time.monotonic() - t0)
+        if remaining <= 0:
+            attempt_error = (
+                f"Exceeded the {molecule_timeout:.0f}s per-compound budget "
+                f"after {attempt - 1} Open Babel attempt(s)."
+            )
+            logger.warning("[%s] %s", job.compound_id, attempt_error)
+            break
+
         logger.debug(
             "[%s] obabel attempt %d/%d: %s",
             job.compound_id, attempt, len(option_sets), opts,
@@ -1096,7 +1213,7 @@ def prepare_one_molecule(
             smi_file=smi_file,
             coord_file=coord_file,
             obabel_options=opts,
-            timeout=obabel_timeout,
+            timeout=max(1, int(min(obabel_timeout, remaining))),
             coord_format=coord_format,
             cancel_event=cancel_event,
         )
@@ -1463,6 +1580,114 @@ def _build_job_list(
 # Public batch entry points
 # ---------------------------------------------------------------------------
 
+# How many completed jobs between writes of the partial results CSV.  Results
+# used to be written only after the very last worker returned, so a single
+# wedged job discarded the entire run — 5,582 successfully prepared molecules
+# in the case that prompted this.  Checkpointing keeps at most this many
+# results at risk.
+_CHECKPOINT_EVERY: int = 200
+
+# How long a batch may go with *no* job finishing before the outstanding
+# workers are written off.  Every per-job path is itself bounded, so with W
+# workers at least W jobs finish per per-job window; a whole window of silence
+# on top of that means something is genuinely wedged rather than merely slow.
+_STALL_GRACE: float = 300.0
+
+# Stand-in per-job bound when the caller asked for no timeout at all
+# (``timeout=None``), so that even an unlimited run keeps a stall guard.
+_DEFAULT_STALL_TIMEOUT: float = 3600.0
+
+
+def _stall_timeout(per_job_timeout: Optional[float]) -> float:
+    """Seconds of zero progress that mark a batch as wedged rather than slow."""
+    return (per_job_timeout or _DEFAULT_STALL_TIMEOUT) + _STALL_GRACE
+
+
+def _write_partial_csv(
+    results: "list[Optional[object]]", csv_path: Path, columns: list[str],
+) -> pd.DataFrame:
+    """Write the results collected so far, skipping jobs still in flight.
+
+    Written to a temporary file and moved into place so that a crash or a
+    forced exit mid-write cannot leave a truncated CSV behind.
+    """
+    rows = [r.to_dict() for r in results if r is not None]  # type: ignore[attr-defined]
+    df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=columns)
+    tmp_path = csv_path.with_name(csv_path.name + ".tmp")
+    try:
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, csv_path)
+    except OSError as exc:
+        logger.warning("Could not write results to %s: %s", csv_path, exc)
+    return df
+
+
+def _collect_results(
+    future_to_idx: "dict",
+    results: list,
+    *,
+    label: str,
+    describe: Callable[[int], str],
+    make_failure: Callable[[int, str], object],
+    stall_timeout: float,
+    checkpoint: Optional[Callable[[], None]] = None,
+) -> None:
+    """Fill *results* from the submitted futures, tolerating a wedged worker.
+
+    :func:`concurrent.futures.as_completed` accepts only a single deadline for
+    the whole iteration, which is unusable for a batch whose total runtime is
+    unknown in advance — so in practice it was called without one and waited
+    forever.  This watches the gap *between* completions instead: once no job
+    has finished for *stall_timeout* seconds the stragglers are written off as
+    failures and the batch returns with everything else intact.
+
+    Slots left empty are filled in as failures too, so the returned frame
+    always has exactly one row per submitted job.
+    """
+    n = len(future_to_idx)
+    pending = set(future_to_idx)
+    completed = 0
+    abandoned = False
+
+    while pending:
+        done, pending = futures_wait(
+            pending, timeout=stall_timeout, return_when=FIRST_COMPLETED,
+        )
+        if not done:
+            logger.error(
+                "%s stalled: no job finished in %.0fs with %d still outstanding. "
+                "Abandoning them so the %d completed result(s) are not lost.",
+                label, stall_timeout, len(pending), completed,
+            )
+            for future in pending:
+                future.cancel()
+            abandoned = True
+            break
+
+        for future in done:
+            idx = future_to_idx[future]
+            completed += 1
+            try:
+                results[idx] = future.result()
+            except Exception as exc:  # pylint: disable=broad-except
+                logger.exception("[%s] Unexpected exception: %s", describe(idx), exc)
+                results[idx] = make_failure(idx, f"Unexpected exception: {exc}")
+            logger.info(
+                "[%d/%d] %s — %s",
+                completed, n, results[idx].compound_id, results[idx].status,
+            )
+            if checkpoint is not None and completed % _CHECKPOINT_EVERY == 0:
+                checkpoint()
+
+    if abandoned:
+        for idx in future_to_idx.values():
+            if results[idx] is None:
+                results[idx] = make_failure(
+                    idx,
+                    f"Worker did not return within {stall_timeout:.0f}s of the "
+                    f"last completed job; abandoned so the batch could finish.",
+                )
+
 
 def _log_batch_finished(
     label: str,
@@ -1507,6 +1732,7 @@ def prepare_batch(
     auto_charge: bool = False,
     coord_format: str = OBABEL_3D_FORMAT,
     cancel_event: Optional[threading.Event] = None,
+    molecule_timeout: Optional[float] = None,
 ) -> pd.DataFrame:
     """Phase 1 batch: SMILES → 3D coordinates → ``.mop`` files.
 
@@ -1548,12 +1774,21 @@ def prepare_batch(
                           running, any compound not yet started is skipped
                           with ``status="cancelled"`` and the in-flight
                           obabel process (if any) is killed immediately.
+        molecule_timeout: Hard wall-clock cap (s) per compound across all
+                          obabel attempts.  Defaults to
+                          ``obabel_timeout * attempts + 30``.  Also sets the
+                          batch's stall threshold: if nothing finishes within
+                          this plus a grace period, the outstanding compounds
+                          are marked ``failed`` and the batch returns rather
+                          than waiting indefinitely.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
         (``ready`` / ``failed`` / ``skipped`` / ``cancelled``), ``mop_file``,
         ``error_message``, ``duration_s``.  Also saved to
-        ``<workdir>/prepare_results.csv``.
+        ``<workdir>/prepare_results.csv``, which is rewritten every
+        ``_CHECKPOINT_EVERY`` compounds so partial results survive an
+        interrupted run.
 
     Raises:
         EnvironmentError: If ``obabel`` is not found in PATH.
@@ -1583,15 +1818,36 @@ def prepare_batch(
     )
     n = len(jobs)
 
+    if molecule_timeout is None:
+        molecule_timeout = (
+            obabel_timeout * (1 + len(OBABEL_FALLBACK_OPTIONS)) + _MOLECULE_TIMEOUT_SLACK
+        )
+
     prep_kwargs = dict(
         overwrite=overwrite,
         obabel_timeout=obabel_timeout,
         obabel_options=obabel_options,
         coord_format=coord_format,
         cancel_event=cancel_event,
+        molecule_timeout=molecule_timeout,
     )
 
+    columns = [
+        "compound_id", "smiles", "status", "mop_file", "error_message", "duration_s",
+    ]
+    csv_path = workdir / "prepare_results.csv"
     results: list[Optional[PrepResult]] = [None] * n
+
+    def _make_failure(idx: int, message: str) -> PrepResult:
+        return PrepResult(
+            compound_id=jobs[idx].compound_id,
+            smiles=jobs[idx].smiles,
+            status="failed",
+            error_message=message,
+        )
+
+    def _checkpoint() -> None:
+        _write_partial_csv(results, csv_path, columns)
 
     if max_workers == 1:
         for idx, job in enumerate(jobs):
@@ -1600,44 +1856,31 @@ def prepare_batch(
                 results[idx] = prepare_one_molecule(job=job, **prep_kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("[%s] Unexpected exception: %s", job.compound_id, exc)
-                results[idx] = PrepResult(
-                    compound_id=job.compound_id, smiles=job.smiles,
-                    status="failed", error_message=f"Unexpected exception: {exc}",
-                )
+                results[idx] = _make_failure(idx, f"Unexpected exception: {exc}")
+            if (idx + 1) % _CHECKPOINT_EVERY == 0:
+                _checkpoint()
     else:
         logger.info("Parallel prepare: %d jobs across %d workers.", n, max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_to_idx = {
                 pool.submit(prepare_one_molecule, job=job, **prep_kwargs): idx
                 for idx, job in enumerate(jobs)
             }
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                completed += 1
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception(
-                        "[%s] Unexpected exception: %s", jobs[idx].compound_id, exc,
-                    )
-                    results[idx] = PrepResult(
-                        compound_id=jobs[idx].compound_id,
-                        smiles=jobs[idx].smiles,
-                        status="failed",
-                        error_message=f"Unexpected exception: {exc}",
-                    )
-                logger.info(
-                    "[%d/%d] %s — %s",
-                    completed, n, results[idx].compound_id, results[idx].status,
-                )
+            _collect_results(
+                future_to_idx, results,
+                label="Prepare",
+                describe=lambda idx: jobs[idx].compound_id,
+                make_failure=_make_failure,
+                stall_timeout=_stall_timeout(molecule_timeout),
+                checkpoint=_checkpoint,
+            )
+        finally:
+            # wait=False: a wedged worker must not be able to hold the batch
+            # hostage at the point where its results are about to be written.
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
-        columns=["compound_id", "smiles", "status", "mop_file", "error_message", "duration_s"]
-    )
-
-    csv_path = workdir / "prepare_results.csv"
-    results_df.to_csv(csv_path, index=False)
+    results_df = _write_partial_csv(results, csv_path, columns)
     _log_batch_finished("Prepare", results_df, csv_path, cancel_event)
     return results_df
 
@@ -1705,7 +1948,23 @@ def run_mopac_batch(
     logger.info("Found %d .mop file(s) in %s.", n, workdir)
 
     run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
+
+    columns = [
+        "compound_id", "smiles", "status",
+        "mop_file", "out_file", "arc_file",
+        "error_message", "return_code", "duration_s",
+    ]
+    csv_path = workdir / "batch_results.csv"
     results: list[Optional[JobResult]] = [None] * n
+
+    def _make_failure(idx: int, message: str) -> JobResult:
+        return JobResult(
+            compound_id=mop_files[idx].stem, smiles="",
+            status="failed", error_message=message,
+        )
+
+    def _checkpoint() -> None:
+        _write_partial_csv(results, csv_path, columns)
 
     if max_workers == 1:
         for idx, mop_file in enumerate(mop_files):
@@ -1714,46 +1973,29 @@ def run_mopac_batch(
                 results[idx] = _run_mopac_one(mop_file, **run_kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("[%s] Unexpected exception: %s", mop_file.stem, exc)
-                results[idx] = JobResult(
-                    compound_id=mop_file.stem, smiles="",
-                    status="failed", error_message=f"Unexpected exception: {exc}",
-                )
+                results[idx] = _make_failure(idx, f"Unexpected exception: {exc}")
+            if (idx + 1) % _CHECKPOINT_EVERY == 0:
+                _checkpoint()
     else:
         logger.info("Parallel MOPAC: %d jobs across %d workers.", n, max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_to_idx = {
                 pool.submit(_run_mopac_one, mop_file, **run_kwargs): idx
                 for idx, mop_file in enumerate(mop_files)
             }
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                completed += 1
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception(
-                        "[%s] Unexpected exception: %s", mop_files[idx].stem, exc,
-                    )
-                    results[idx] = JobResult(
-                        compound_id=mop_files[idx].stem, smiles="",
-                        status="failed", error_message=f"Unexpected exception: {exc}",
-                    )
-                logger.info(
-                    "[%d/%d] %s — %s",
-                    completed, n, results[idx].compound_id, results[idx].status,
-                )
+            _collect_results(
+                future_to_idx, results,
+                label="MOPAC batch",
+                describe=lambda idx: mop_files[idx].stem,
+                make_failure=_make_failure,
+                stall_timeout=_stall_timeout(timeout),
+                checkpoint=_checkpoint,
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
-        columns=[
-            "compound_id", "smiles", "status",
-            "mop_file", "out_file", "arc_file",
-            "error_message", "return_code", "duration_s",
-        ]
-    )
-
-    csv_path = workdir / "batch_results.csv"
-    results_df.to_csv(csv_path, index=False)
+    results_df = _write_partial_csv(results, csv_path, columns)
     _log_batch_finished("MOPAC batch", results_df, csv_path, cancel_event)
     return results_df
 
@@ -1841,7 +2083,24 @@ def run_pipeline(
         cancel_event=cancel_event,
     )
 
+    columns = [
+        "compound_id", "smiles", "status",
+        "mop_file", "out_file", "arc_file",
+        "error_message", "return_code", "duration_s",
+    ]
+    csv_path = workdir / "batch_results.csv"
     results: list[Optional[JobResult]] = [None] * n
+
+    def _make_failure(idx: int, message: str) -> JobResult:
+        return JobResult(
+            compound_id=jobs[idx].compound_id,
+            smiles=jobs[idx].smiles,
+            status="failed",
+            error_message=message,
+        )
+
+    def _checkpoint() -> None:
+        _write_partial_csv(results, csv_path, columns)
 
     if max_workers == 1:
         for idx, job in enumerate(jobs):
@@ -1850,48 +2109,33 @@ def run_pipeline(
                 results[idx] = process_one_molecule(job=job, **run_kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("[%s] Unexpected exception: %s", job.compound_id, exc)
-                results[idx] = JobResult(
-                    compound_id=job.compound_id, smiles=job.smiles,
-                    status="failed", error_message=f"Unexpected exception: {exc}",
-                )
+                results[idx] = _make_failure(idx, f"Unexpected exception: {exc}")
+            if (idx + 1) % _CHECKPOINT_EVERY == 0:
+                _checkpoint()
     else:
         logger.info("Parallel batch: %d jobs across %d workers.", n, max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_to_idx = {
                 pool.submit(process_one_molecule, job=job, **run_kwargs): idx
                 for idx, job in enumerate(jobs)
             }
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                completed += 1
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception(
-                        "[%s] Unexpected exception: %s", jobs[idx].compound_id, exc,
-                    )
-                    results[idx] = JobResult(
-                        compound_id=jobs[idx].compound_id,
-                        smiles=jobs[idx].smiles,
-                        status="failed",
-                        error_message=f"Unexpected exception: {exc}",
-                    )
-                logger.info(
-                    "[%d/%d] %s — %s",
-                    completed, n, results[idx].compound_id, results[idx].status,
-                )
+            _collect_results(
+                future_to_idx, results,
+                label="Pipeline",
+                describe=lambda idx: jobs[idx].compound_id,
+                make_failure=_make_failure,
+                # One pipeline job runs obabel and then MOPAC back to back.
+                stall_timeout=_stall_timeout(
+                    (obabel_timeout * (1 + len(OBABEL_FALLBACK_OPTIONS)))
+                    + (timeout or _DEFAULT_STALL_TIMEOUT)
+                ),
+                checkpoint=_checkpoint,
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
-        columns=[
-            "compound_id", "smiles", "status",
-            "mop_file", "out_file", "arc_file",
-            "error_message", "return_code", "duration_s",
-        ]
-    )
-
-    csv_path = workdir / "batch_results.csv"
-    results_df.to_csv(csv_path, index=False)
+    results_df = _write_partial_csv(results, csv_path, columns)
     _log_batch_finished("Pipeline", results_df, csv_path, cancel_event)
     return results_df
 
@@ -1953,7 +2197,21 @@ def export_sdf(
     logger.info("Found %d .arc file(s) to convert.", n)
 
     run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
+
+    columns = [
+        "compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s",
+    ]
+    csv_path = workdir / "sdf_results.csv"
     results: list[Optional[SdfResult]] = [None] * n
+
+    def _make_failure(idx: int, message: str) -> SdfResult:
+        return SdfResult(
+            compound_id=arc_files[idx].stem, arc_file=arc_files[idx],
+            status="failed", error_message=message,
+        )
+
+    def _checkpoint() -> None:
+        _write_partial_csv(results, csv_path, columns)
 
     if max_workers == 1:
         for idx, arc_file in enumerate(arc_files):
@@ -1963,13 +2221,13 @@ def export_sdf(
                 results[idx] = _convert_arc_to_sdf(arc_file, sdf_file, **run_kwargs)
             except Exception as exc:  # pylint: disable=broad-except
                 logger.exception("[%s] Unexpected exception: %s", arc_file.stem, exc)
-                results[idx] = SdfResult(
-                    compound_id=arc_file.stem, arc_file=arc_file,
-                    status="failed", error_message=f"Unexpected exception: {exc}",
-                )
+                results[idx] = _make_failure(idx, f"Unexpected exception: {exc}")
+            if (idx + 1) % _CHECKPOINT_EVERY == 0:
+                _checkpoint()
     else:
         logger.info("Parallel SDF export: %d files across %d workers.", n, max_workers)
-        with ThreadPoolExecutor(max_workers=max_workers) as pool:
+        pool = ThreadPoolExecutor(max_workers=max_workers)
+        try:
             future_to_idx = {
                 pool.submit(
                     _convert_arc_to_sdf,
@@ -1979,31 +2237,18 @@ def export_sdf(
                 ): idx
                 for idx, arc_file in enumerate(arc_files)
             }
-            completed = 0
-            for future in as_completed(future_to_idx):
-                idx = future_to_idx[future]
-                completed += 1
-                try:
-                    results[idx] = future.result()
-                except Exception as exc:  # pylint: disable=broad-except
-                    logger.exception(
-                        "[%s] Unexpected exception: %s", arc_files[idx].stem, exc,
-                    )
-                    results[idx] = SdfResult(
-                        compound_id=arc_files[idx].stem, arc_file=arc_files[idx],
-                        status="failed", error_message=f"Unexpected exception: {exc}",
-                    )
-                logger.info(
-                    "[%d/%d] %s — %s",
-                    completed, n, results[idx].compound_id, results[idx].status,
-                )
+            _collect_results(
+                future_to_idx, results,
+                label="SDF export",
+                describe=lambda idx: arc_files[idx].stem,
+                make_failure=_make_failure,
+                stall_timeout=_stall_timeout(timeout),
+                checkpoint=_checkpoint,
+            )
+        finally:
+            pool.shutdown(wait=False, cancel_futures=True)
 
-    results_df = pd.DataFrame([r.to_dict() for r in results]) if results else pd.DataFrame(
-        columns=["compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s"]
-    )
-
-    csv_path = workdir / "sdf_results.csv"
-    results_df.to_csv(csv_path, index=False)
+    results_df = _write_partial_csv(results, csv_path, columns)
     _log_batch_finished("SDF export", results_df, csv_path, cancel_event)
     return results_df
 
@@ -2220,33 +2465,42 @@ def retry_failed_batch(
             obabel_options=obabel_options, coord_format=coord_format,
             cancel_event=cancel_event,
         )
+        def _make_prep_failure(idx: int, message: str) -> PrepResult:
+            return PrepResult(
+                compound_id=obabel_jobs[idx].compound_id,
+                smiles=obabel_jobs[idx].smiles,
+                status="failed", error_message=message,
+            )
+
+        prep_slots: list[Optional[PrepResult]] = [None] * len(obabel_jobs)
+
         if max_workers == 1:
-            for job in obabel_jobs:
+            for idx, job in enumerate(obabel_jobs):
                 try:
-                    prep_retry_results.append(prepare_one_molecule(job=job, **prep_kwargs))
+                    prep_slots[idx] = prepare_one_molecule(job=job, **prep_kwargs)
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
-                    prep_retry_results.append(PrepResult(
-                        compound_id=job.compound_id, smiles=job.smiles,
-                        status="failed", error_message=f"Unexpected exception: {exc}",
-                    ))
+                    prep_slots[idx] = _make_prep_failure(idx, f"Unexpected exception: {exc}")
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_job = {
-                    pool.submit(prepare_one_molecule, job=job, **prep_kwargs): job
-                    for job in obabel_jobs
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                future_to_idx = {
+                    pool.submit(prepare_one_molecule, job=job, **prep_kwargs): idx
+                    for idx, job in enumerate(obabel_jobs)
                 }
-                for future in as_completed(future_to_job):
-                    job = future_to_job[future]
-                    try:
-                        prep_retry_results.append(future.result())
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
-                        prep_retry_results.append(PrepResult(
-                            compound_id=job.compound_id, smiles=job.smiles,
-                            status="failed", error_message=f"Unexpected exception: {exc}",
-                        ))
+                _collect_results(
+                    future_to_idx, prep_slots,
+                    label="Retry prepare",
+                    describe=lambda idx: obabel_jobs[idx].compound_id,
+                    make_failure=_make_prep_failure,
+                    stall_timeout=_stall_timeout(
+                        obabel_timeout * (1 + len(OBABEL_FALLBACK_OPTIONS))
+                    ),
+                )
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
+        prep_retry_results.extend(r for r in prep_slots if r is not None)
         prep_retry_df = pd.DataFrame([r.to_dict() for r in prep_retry_results])
         prepare_df = _merge_retry_results(prepare_df, prep_retry_df)
         prepare_df.to_csv(prepare_csv, index=False)
@@ -2269,34 +2523,43 @@ def retry_failed_batch(
         )
         run_kwargs = dict(timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event)
 
+        def _make_mopac_failure(idx: int, message: str) -> JobResult:
+            return JobResult(
+                compound_id=mopac_target_jobs[idx].compound_id,
+                smiles=mopac_target_jobs[idx].smiles,
+                status="failed", error_message=message,
+            )
+
+        mopac_slots: list[Optional[JobResult]] = [None] * len(mopac_target_jobs)
+
         if max_workers == 1:
-            for job in mopac_target_jobs:
+            for idx, job in enumerate(mopac_target_jobs):
                 mop_file = job.job_dir / f"{job.compound_id}.mop"
                 try:
-                    mopac_retry_results.append(_run_mopac_one(mop_file, **run_kwargs))
+                    mopac_slots[idx] = _run_mopac_one(mop_file, **run_kwargs)
                 except Exception as exc:  # pylint: disable=broad-except
                     logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
-                    mopac_retry_results.append(JobResult(
-                        compound_id=job.compound_id, smiles=job.smiles,
-                        status="failed", error_message=f"Unexpected exception: {exc}",
-                    ))
+                    mopac_slots[idx] = _make_mopac_failure(idx, f"Unexpected exception: {exc}")
         else:
-            with ThreadPoolExecutor(max_workers=max_workers) as pool:
-                future_to_job = {
-                    pool.submit(_run_mopac_one, job.job_dir / f"{job.compound_id}.mop", **run_kwargs): job
-                    for job in mopac_target_jobs
+            pool = ThreadPoolExecutor(max_workers=max_workers)
+            try:
+                future_to_idx = {
+                    pool.submit(
+                        _run_mopac_one, job.job_dir / f"{job.compound_id}.mop", **run_kwargs,
+                    ): idx
+                    for idx, job in enumerate(mopac_target_jobs)
                 }
-                for future in as_completed(future_to_job):
-                    job = future_to_job[future]
-                    try:
-                        mopac_retry_results.append(future.result())
-                    except Exception as exc:  # pylint: disable=broad-except
-                        logger.exception("[%s] Unexpected exception during retry: %s", job.compound_id, exc)
-                        mopac_retry_results.append(JobResult(
-                            compound_id=job.compound_id, smiles=job.smiles,
-                            status="failed", error_message=f"Unexpected exception: {exc}",
-                        ))
+                _collect_results(
+                    future_to_idx, mopac_slots,
+                    label="Retry MOPAC",
+                    describe=lambda idx: mopac_target_jobs[idx].compound_id,
+                    make_failure=_make_mopac_failure,
+                    stall_timeout=_stall_timeout(mopac_timeout),
+                )
+            finally:
+                pool.shutdown(wait=False, cancel_futures=True)
 
+        mopac_retry_results.extend(r for r in mopac_slots if r is not None)
         mopac_retry_df = pd.DataFrame([r.to_dict() for r in mopac_retry_results])
         batch_df = _merge_retry_results(batch_df, mopac_retry_df)
         batch_df.to_csv(batch_csv, index=False)

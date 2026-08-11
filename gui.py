@@ -58,6 +58,10 @@ DEFAULT_WORKERS = min(4, os.cpu_count() or 4)
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "icon.png"
 
+# Seconds a running phase gets to wind down after the window is closed before
+# the process exits regardless. See MainWindow.closeEvent.
+_FORCED_EXIT_GRACE_S: float = 10.0
+
 PROVENANCE_PATH = Path(__file__).resolve().parent / "provenance.json"
 # Kept in sync with provenance.json; used only if that file is missing or
 # malformed so a broken/deleted provenance file can't stop the app launching.
@@ -1026,6 +1030,45 @@ class MainWindow(QMainWindow):
         self.stop_button.setEnabled(False)
         self.stop_button.setText("Stopping...")
         _runner_logger.info("Stop requested by user -- killing the current job(s).")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+        """Make closing the window actually end the process.
+
+        The PhaseWorker thread is a daemon, but the ThreadPoolExecutor that
+        the batch functions run inside is not: concurrent.futures registers an
+        atexit hook that joins its worker threads, so a single worker stuck on
+        an unresponsive external process kept the whole app alive after the
+        window was gone -- it had to be killed from the terminal.
+
+        So: ask nicely first, then leave via os._exit, which skips the atexit
+        machinery. Results are safe to abandon this way because every batch
+        function checkpoints its CSV as jobs complete rather than only at the
+        end (see _write_partial_csv in mopac_batch_runner.py).
+        """
+        if self._phase_running:
+            self._cancel_event.set()
+            _runner_logger.info("Window closed -- stopping the running phase.")
+
+        event.accept()
+        super().closeEvent(event)
+
+        if self._phase_running:
+            # A plain daemon timer rather than QTimer.singleShot: closing the
+            # last window stops the Qt event loop, so a queued Qt timer would
+            # never fire -- and the interpreter would then block in the very
+            # atexit join this is here to escape.
+            watchdog = threading.Timer(_FORCED_EXIT_GRACE_S, self._force_exit)
+            watchdog.daemon = True
+            watchdog.start()
+
+    @staticmethod
+    def _force_exit() -> None:
+        _runner_logger.warning(
+            "Worker threads did not stop within %.0fs of closing the window; "
+            "exiting anyway.", _FORCED_EXIT_GRACE_S,
+        )
+        logging.shutdown()
+        os._exit(0)
 
     # ------------------------------------------------------------------
     # Button gating
