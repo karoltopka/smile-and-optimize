@@ -191,3 +191,9 @@ prepare_results.csv
 /pfas_test
 /PXR_OPT
 *.xlsx
+
+# Third-party installers (MOPAC/Open Babel) -- never commit these, see the
+# "Third-Party Software" section in README.md. Download from the official
+# release pages linked there instead.
+*.exe
+*.msi

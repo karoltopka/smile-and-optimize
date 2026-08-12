@@ -4,7 +4,7 @@
 
 # SMILE and optimize
 
-**Created by Maciej Gromelski** · v1.1.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
+**Created by Maciej Gromelski** · v1.2.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
 
 Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**, available two ways:
 
@@ -44,10 +44,12 @@ pip install pandas
 
 ### External tools (must be on system PATH)
 
-| Tool | Tested version | Download |
-|---|---|---|
-| [Open Babel](http://openbabel.org) | 3.1.0 – 3.1.1 | https://github.com/openbabel/openbabel/releases |
-| [MOPAC](http://openmopac.net) | 23.2.1 | https://github.com/openmopac/mopac/releases |
+| Tool | License | Tested version | Download (exact tested release) |
+|---|---|---|---|
+| [Open Babel](http://openbabel.org) | GPLv2 | 3.1.0 – 3.1.1 | [openbabel-3-1-1 release page](https://github.com/openbabel/openbabel/releases/tag/openbabel-3-1-1) (Windows x64 `.exe` installer under Assets) |
+| [MOPAC](http://openmopac.net) | Apache License 2.0 | 23.2.5 | [v23.2.5 release page](https://github.com/openmopac/mopac/releases/tag/v23.2.5) (Windows `.exe` installer under Assets) |
+
+Neither tool is bundled with or distributed by this repository — download the installer from the linked release page and run it yourself. This keeps you on the exact version this pipeline was tested against and keeps each tool's own license (and any obligations that come with it, e.g. GPL source-availability for Open Babel) squarely with its own project. See [Third-party software](#third-party-software) below for what that means for this repo's own license.
 
 > **Note:** Some Open Babel builds (including certain 3.1.0 installers) are missing the XYZ output format. The pipeline defaults to **MOL2** (`mol2`) to avoid this issue. See [3D coordinate format](#3d-coordinate-format) for details.
 
@@ -802,6 +804,7 @@ The GUI attaches its own log handler to this same logger and streams everything 
   - **Stall detection** — batches now watch the gap *between* completions rather than waiting indefinitely for stragglers. If no job finishes for the per-job timeout plus a 5-minute grace period, the outstanding jobs are recorded as `failed` and the batch returns. Every submitted compound still gets exactly one row in the results.
 - **Fixed: closing the GUI window did not end the process.** The batch worker ran inside a `ThreadPoolExecutor`, whose threads are joined by an `atexit` hook — so a single stuck worker kept the app alive after the window was gone and it had to be killed from the terminal. Closing now cancels the running phase and force-exits after a 10-second grace period.
 - **Known limitation retired** — the `cancel_event` note about child processes not spawning their own children no longer applies; cancellation and timeouts now kill the full process tree.
+- **Stopped bundling the MOPAC/Open Babel installers** — they were briefly committed under `assets/`; removed so the repo doesn't carry (and isn't responsible for satisfying) Open Babel's GPLv2 source-availability obligation for redistributed binaries. The Requirements table now links directly to the exact tested release pages instead. See [Third-party software](#third-party-software).
 
 ### v1.1.0
 
@@ -816,6 +819,21 @@ The GUI attaches its own log handler to this same logger and streams everything 
 ### v1.0.0
 
 Initial release: three-phase pipeline (`prepare_batch` → `run_mopac_batch` → `export_sdf`), combined `run_pipeline`, desktop GUI, RDKit-based `auto_charge`, obabel 3D-generation fallback chain, and parallel execution via `max_workers`.
+
+---
+
+## Third-party software
+
+This repository does not include or redistribute Open Babel or MOPAC. Both are external tools you download and install yourself from their official release pages (see [External tools](#external-tools-must-be-on-system-path)), and this pipeline calls them via `subprocess` as separate command-line programs — they are never linked into or bundled with this code.
+
+Each keeps its own, independent license:
+
+| Tool | License | License text |
+|---|---|---|
+| Open Babel | GNU General Public License v2 (GPLv2) | https://github.com/openbabel/openbabel/blob/master/COPYING |
+| MOPAC | Apache License 2.0 | https://github.com/openmopac/mopac/blob/main/LICENSE |
+
+The **[PolyForm Noncommercial License](LICENSE)** below covers only the code in *this* repository (`mopac_batch_runner.py`, `gui.py`, and everything else here). It does not apply to, and does not change the terms of, Open Babel or MOPAC — installing and using those tools is governed entirely by their own licenses linked above, independent of anything in this repo.
 
 ---
 
