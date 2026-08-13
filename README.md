@@ -4,11 +4,11 @@
 
 # SMILE and optimize
 
-**Created by Maciej Gromelski** · v1.2.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
+**Created by Maciej Gromelski** · v1.3.0 · Licensed under the [PolyForm Noncommercial License 1.0.0](LICENSE) — free for academic, research, and personal use; **commercial use is not permitted**.
 
 Automated batch pipeline: **SMILES → 3D structure (Open Babel) → MOPAC input → MOPAC semi-empirical optimisation → structured results**, available two ways:
 
-- **Desktop GUI** (`gui.py`, "SMILE and optimize") — a point-and-click PySide6 app: load a spreadsheet of SMILES, configure the run, and step through Prepare → Run MOPAC → Export SDF while watching live results and logs.
+- **Desktop GUI** (`gui.py`, "SMILE and optimize") — a point-and-click PySide6 app: load a spreadsheet of SMILES, configure the run, and step through Prepare → Run MOPAC → Export SDF while watching live results and logs. Long runs survive closing the app: see [Workspaces & resuming a session](#workspaces--resuming-a-session).
 - **Python API** (`mopac_batch_runner.py`) — call the same pipeline programmatically from a script or Jupyter notebook.
 
 The pipeline itself can be run as a **single combined call** or split into three independent phases:
@@ -72,7 +72,7 @@ Clone or copy this repository, then install dependencies:
 pip install -r requirements.txt
 ```
 
-If you only want the library (`mopac_batch_runner.py`) and not the GUI, you can instead just copy that single file into your project — no package installation is required beyond `pandas`.
+If you only want the library (`mopac_batch_runner.py`) and not the GUI, you can instead just copy that single file into your project — no package installation is required beyond `pandas`. The GUI additionally needs `gui.py` and `workspace.py` (workspace save/restore) alongside it.
 
 ---
 
@@ -89,15 +89,77 @@ py gui.py
 1. **Load input data** — under *1. Input Data*, click *Browse…* and pick an `.xlsx` or `.csv` file containing your compounds, then choose which column holds the SMILES strings and (optionally) which holds the compound IDs.
 2. **Set the working directory** — where all generated files (`.mop`, `.out`, `.arc`, `.sdf`, per-phase result CSVs) get written. Defaults to `mopac_jobs`.
 3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, Prepare/MOPAC/Export timeouts, retry-specific timeouts and an optional retry MOPAC keyword override (see *Retrying failed jobs* below), and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
-4. **Click SAVE SETTINGS** to lock the Settings section. This is a confirmation step (not a saved config file) — it prevents changing keywords/workers/timeouts by accident mid-run, and it's also what unlocks the *1. Prepare* button. Click *EDIT SETTINGS* to unlock and make changes again.
-5. **Run the three phases in order** — each button unlocks once the previous phase has completed:
+4. **Click SAVE SETTINGS** to lock the Settings section. It prevents changing keywords/workers/timeouts by accident mid-run, and it's also what unlocks the *1. Prepare* button. Click *EDIT SETTINGS* to unlock and make changes again. Locking also writes the current settings into the workspace file (see [Workspaces](#workspaces--resuming-a-session)).
+5. **Run the three phases in order:**
    - **1. Prepare (SMILES → .mop)**
    - **2. Run MOPAC**
    - **3. Export SDF** (also copies to the SDF catalogue folder, if enabled)
 6. **Watch progress** on the right: a live results table (failed/timeout rows highlighted) refreshed after each phase, and a running log console.
-7. **Retry Failed Jobs** — once *2. Run MOPAC* has completed at least once, this button becomes enabled whenever any compound is still `failed`/`timeout`. It re-runs only those compounds (both Open-Babel-stage and MOPAC-stage failures) using the retry timeouts/keywords from Settings, then refreshes the table. Safe to click repeatedly — e.g. loosen the retry timeout further and click again if some jobs still don't converge.
+7. **Retry Failed Jobs** — enabled whenever an input file is loaded and any compound is still `failed`/`timeout`/`cancelled`. It re-runs only those compounds (both Open-Babel-stage and MOPAC-stage failures) using the retry timeouts/keywords from Settings, then refreshes the table. Safe to click repeatedly — e.g. loosen the retry timeout further and click again if some jobs still don't converge.
 
-Phases are strictly sequential in the GUI — each must finish before the next unlocks. If you need to resume a `workdir` from a previous session without redoing earlier phases (e.g. jump straight to `run_mopac_batch` on an existing set of `.mop` files), use the Python API below instead.
+*2. Run MOPAC* and *3. Export SDF* also unlock from what is already in the working directory, so you can point the app at a `workdir` from a previous session — or one produced by the Python API or the notebook — and carry on from there. Only *1. Prepare* and *Retry Failed Jobs* additionally require the input spreadsheet, because both rebuild compound IDs from it.
+
+---
+
+## Workspaces & resuming a session
+
+Long runs outlive the app. A 20,000-compound preparation can take hours, and closing the window used to mean starting over: the input file, the Settings and the phase progress lived only in memory.
+
+The GUI now keeps a **workspace** — a small `workspace.json` written into the working directory, next to the result CSVs and job folders it describes:
+
+```
+mopac_jobs/
+  workspace.json       # ← input file + columns, Settings, per-phase progress
+  prepare_results.csv
+  batch_results.csv
+  ...
+```
+
+### It saves itself
+
+You do not have to remember to save. The workspace is written:
+
+- **when a phase starts** — recorded as `running`, so a crash or a forced exit ninety minutes into a two-hour Prepare is still recoverable;
+- **when a phase finishes** — with the per-status counts;
+- **when you click SAVE SETTINGS**;
+- **when you close the window.**
+
+*File ▸ Save Workspace* (Ctrl+S) forces a save at any time. *File ▸ Save Workspace As…* exports a copy elsewhere — for sharing or archiving a configuration — without moving where autosave writes.
+
+### Reopening one
+
+Point *Working Directory* at a folder that contains a `workspace.json` and the app offers to restore it. *File ▸ Open Workspace* (Ctrl+O) and *File ▸ Recent Workspaces* do the same thing explicitly.
+
+Restoring brings back the input file and its column choices, every Settings value, the lock state, and the results table (reloaded from the per-phase CSVs), then scans the working directory to report exactly what is on disk.
+
+If the run was interrupted or left failures, you are asked how to restore it:
+
+| Choice | Effect |
+|---|---|
+| **Resume — skip completed** | Turns **Overwrite off**, so compounds that already have their `.mop`/`.out`/`.sdf` are skipped instead of recomputed. This is what you want after an interrupted run. |
+| **Restore settings as saved** | Restores the saved `overwrite` value verbatim. Use this when you deliberately want a full recomputation. |
+
+> **Why this matters.** Overwrite defaults to *on* in the GUI. Restoring an interrupted 20,000-compound Prepare and pressing *1. Prepare* again with it on would redo every hour already spent. Resuming turns it off, and the run finishes in minutes.
+
+### If the input file moved or changed
+
+Compound IDs are rebuilt from the whole spreadsheet in row order, so the file matters. The workspace stores a SHA-256 of it and checks on restore:
+
+- **Missing** — you are offered a *Locate file…* dialog. Declining is fine: *2. Run MOPAC* and *3. Export SDF* read the working directory alone and stay usable; only *1. Prepare* and *Retry Failed Jobs* need the spreadsheet.
+- **Changed** — you get a warning. If rows were added, removed or reordered, *Retry Failed Jobs* can match compounds to the wrong job folders. Prepare into a fresh working directory instead.
+
+### Menus
+
+| Menu | Contents |
+|---|---|
+| **File** | Open / Recent / Save / Save As, Load Input File, Close Workspace, Exit |
+| **Run** | The four phase actions (Ctrl+1…Ctrl+4) and Stop (Ctrl+.), mirroring the buttons |
+| **Tools** | Check Environment, Scan Working Directory, open the working directory or SDF catalogue in Explorer, Clear Log |
+| **Help** | Documentation, About |
+
+*Tools ▸ Scan Working Directory* counts the `.mop`/`.out`/`.arc`/`.sdf` files actually present. This is more accurate than the result CSVs after an abrupt exit: those are only rewritten every 200 completed jobs, so they can lag by up to 199 compounds whose files are already on disk.
+
+Deleting `workspace.json` costs you nothing but the GUI-side context — every `.mop`, `.out`, `.arc` and CSV stays where it is, and the later phases still unlock from the directory contents.
 
 ---
 
@@ -477,6 +539,7 @@ mopac_jobs/
   prepare_results.csv  # Summary table from prepare_batch
   batch_results.csv    # Summary table from run_mopac_batch / run_pipeline
   sdf_results.csv      # Summary table from export_sdf
+  workspace.json       # GUI session state (see Workspaces) — not written by the library
 ```
 
 ---
@@ -594,7 +657,7 @@ Each phase has its own skip logic, both controlled by `overwrite`.
 | `run_mopac_batch` | `.out` file already exists | Re-run MOPAC |
 | `run_pipeline` | `.out` file already exists | Re-run both Open Babel and MOPAC |
 
-This makes it safe to resume an interrupted batch:
+This makes it safe to resume an interrupted batch. (In the GUI, restoring a workspace in *Resume* mode is exactly this — it sets `overwrite` to `False` for you; see [Workspaces](#workspaces--resuming-a-session).)
 
 ```python
 # Resume preparation — skips compounds whose .mop already exists.
@@ -786,14 +849,26 @@ The GUI attaches its own log handler to this same logger and streams everything 
 - **MOPAC keyword line length** — MOPAC has an 80-character limit per keyword line. Long auto-generated keyword strings (charge + high spin multiplicity) may need manual splitting.
 - **`obabel.log` shows only the last attempt** — when fallbacks are triggered, earlier attempt logs are overwritten. Inspect the `error_message` column in `prepare_results.csv` to see which attempt failed and why.
 - **`run_mopac_batch` discovers `.mop` files alphabetically** — the row order in `batch_results.csv` reflects filesystem sort order, not the original DataFrame order. Join on `compound_id` if you need to align with the input.
-- **GUI phases are strictly sequential** — unlike the library (which lets you call `run_mopac_batch`/`export_sdf` independently against an existing `workdir`), the GUI requires each phase button to unlock in order within a session. Use the Python API for cross-session resumability.
-- **`retry_failed_batch` requires the original DataFrame, unmodified** — it reconstructs compound IDs by re-running the same ID-assignment logic as `prepare_batch` over the full `df`. If you used auto-generated sequential IDs (no `id_col`) and pass a different or reordered DataFrame on retry, compounds will be matched to the wrong directories. Always keep the original `df` around for the lifetime of a `workdir`.
+- **`retry_failed_batch` requires the original DataFrame, unmodified** — it reconstructs compound IDs by re-running the same ID-assignment logic as `prepare_batch` over the full `df`. If you used auto-generated sequential IDs (no `id_col`) and pass a different or reordered DataFrame on retry, compounds will be matched to the wrong directories. Always keep the original `df` around for the lifetime of a `workdir`. The GUI guards against this by fingerprinting the input file in the workspace and warning on restore if it changed, but the library cannot check for you.
+- **No numeric progress** — the GUI progress bar is indeterminate. Per-compound progress is visible only as `[i/n]` lines in the log console, and as counts in the results table once a phase finishes.
 - **`cancel_event` kills the whole obabel/MOPAC process, not a sub-step within it** — cancellation terminates the child process tree, so a partially-completed optimisation cannot be resumed from where it stopped. A killed MOPAC job leaves behind whatever partial `.out` file it had written; the next `overwrite=True` run (including `retry_failed_batch`) simply overwrites it, same as an ordinary timeout.
 - **A wedged external process leaks two reader threads** — if obabel or MOPAC survives a process-tree kill *and* something still holds its output pipes open, the pipes are abandoned so the batch can continue. This leaks the pair of daemon threads `subprocess` uses to read them, for the remaining life of the process. It is bounded and rare (once per wedged job), and preferable to the alternative, which was hanging the batch.
 
 ---
 
 ## Changelog
+
+### v1.3.0
+
+- **Workspaces — the GUI can now pick up where it left off.** A long run used to end at the window's close button: the input file, the Settings and the phase progress lived only in memory, so a 20,000-compound preparation that took two hours had to be started over. The GUI now writes a `workspace.json` into the working directory and restores from it. See [Workspaces & resuming a session](#workspaces--resuming-a-session).
+  - **Saves itself** at the start of each phase (recorded as `running`, which is what makes a crash mid-run recoverable), at the end of each phase, on SAVE SETTINGS, and on close — plus *File ▸ Save Workspace*. Written atomically, so an interrupted write cannot leave a corrupt file.
+  - **Restores** the input file and its column choices, every Settings value, the lock state, and the results table (reloaded from the per-phase CSVs), then scans the working directory to report exactly what is on disk.
+  - **Resume mode** turns Overwrite *off* when a restored run was interrupted or left failures, so compounds that already have their `.mop`/`.out`/`.sdf` are skipped rather than recomputed. Overwrite defaults to on, so without this a resumed run would silently redo everything.
+  - **Input-file fingerprinting** — a SHA-256 is stored with the workspace. A missing file offers a *Locate file…* dialog; a changed one warns, because compound IDs are rebuilt from the spreadsheet in row order.
+- **Application menu bar** — File / Run / Tools / Help, with keyboard shortcuts for every phase (Ctrl+1…Ctrl+4, Ctrl+. to stop). Adds a recent-workspaces list, *Tools ▸ Scan Working Directory*, shortcuts to open the working directory and SDF catalogue in Explorer, and About. The status bar now shows which workspace is loaded and when it was last written.
+- **Known limitation retired: GUI phases are no longer strictly sequential.** *2. Run MOPAC* and *3. Export SDF* now unlock from what is in the working directory (`*/*.mop` and `*/*.arc` respectively), matching what the library always allowed. A `workdir` produced by the Python API, by `runner.ipynb`, or by an earlier session is picked up as-is — no workspace file needed. *1. Prepare* and *Retry Failed Jobs* still require the input spreadsheet, since both rebuild compound IDs from it.
+- **Fixed: `retry_failed_batch` wrote its result CSVs non-atomically** — unlike every other writer in the pipeline. A crash partway through truncated exactly the files a resumed session reads back to work out what already succeeded. Both now go through the same temp-file-and-rename path as the phase functions.
+- **Fixed: a dead `QTimer` leaked per phase run** — the worker poll timer was constructed inside `_start_phase`, leaving an orphaned timer parented to the window after every phase. It is now created once.
 
 ### v1.2.0
 

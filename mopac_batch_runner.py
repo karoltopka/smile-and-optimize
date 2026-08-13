@@ -1613,13 +1613,24 @@ def _write_partial_csv(
     """
     rows = [r.to_dict() for r in results if r is not None]  # type: ignore[attr-defined]
     df = pd.DataFrame(rows) if rows else pd.DataFrame(columns=columns)
+    _write_csv_atomic(df, csv_path)
+    return df
+
+
+def _write_csv_atomic(df: pd.DataFrame, csv_path: Path) -> None:
+    """Write *df* to *csv_path* via a temp file and an atomic rename.
+
+    Shared by the phase functions and by :func:`retry_failed_batch`, which
+    used to write its two CSVs directly -- a crash partway through would
+    truncate exactly the files a resumed session reads back to work out what
+    already succeeded.
+    """
     tmp_path = csv_path.with_name(csv_path.name + ".tmp")
     try:
         df.to_csv(tmp_path, index=False)
         os.replace(tmp_path, csv_path)
     except OSError as exc:
         logger.warning("Could not write results to %s: %s", csv_path, exc)
-    return df
 
 
 def _collect_results(
@@ -2503,7 +2514,7 @@ def retry_failed_batch(
         prep_retry_results.extend(r for r in prep_slots if r is not None)
         prep_retry_df = pd.DataFrame([r.to_dict() for r in prep_retry_results])
         prepare_df = _merge_retry_results(prepare_df, prep_retry_df)
-        prepare_df.to_csv(prepare_csv, index=False)
+        _write_csv_atomic(prepare_df, prepare_csv)
 
     newly_ready_ids = {r.compound_id for r in prep_retry_results if r.status == "ready"}
 
@@ -2562,7 +2573,7 @@ def retry_failed_batch(
         mopac_retry_results.extend(r for r in mopac_slots if r is not None)
         mopac_retry_df = pd.DataFrame([r.to_dict() for r in mopac_retry_results])
         batch_df = _merge_retry_results(batch_df, mopac_retry_df)
-        batch_df.to_csv(batch_csv, index=False)
+        _write_csv_atomic(batch_df, batch_csv)
 
     recovered = sum(1 for r in mopac_retry_results if r.status == "success")
     still_failed_obabel = len(obabel_jobs) - len(newly_ready_ids)

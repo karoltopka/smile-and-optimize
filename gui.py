@@ -20,8 +20,16 @@ import threading
 from pathlib import Path
 
 import pandas as pd
-from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QSettings, Qt, QTimer, QUrl
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDesktopServices,
+    QFontDatabase,
+    QIcon,
+    QKeySequence,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -35,6 +43,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPlainTextEdit,
     QProgressBar,
@@ -46,6 +55,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+import workspace as ws
 from mopac_batch_runner import (
     export_sdf,
     prepare_batch,
@@ -57,6 +67,56 @@ from mopac_batch_runner import (
 DEFAULT_WORKERS = min(4, os.cpu_count() or 4)
 ASSETS_DIR = Path(__file__).resolve().parent / "assets"
 ICON_PATH = ASSETS_DIR / "icon.png"
+README_PATH = Path(__file__).resolve().parent / "README.md"
+
+# QSettings scope for things that belong to the *application* rather than to
+# any one workspace: the recent-workspaces list. Everything that describes a
+# run lives in <workdir>/workspace.json instead, so a working directory stays
+# self-describing when it is copied to another machine.
+_ORG_NAME = "SMILE and optimize"
+_APP_NAME = "SMILE and optimize"
+_RECENT_KEY = "recentWorkspaces"
+_MAX_RECENT = 8
+
+# Single source of truth for the Settings group: (workspace key, MainWindow
+# attribute, kind). Drives workspace save/restore AND the SAVE SETTINGS lock,
+# so a new setting only has to be added in one place. Previously the lock kept
+# its own hand-maintained copy of this list.
+_SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
+    ("keywords", "keywords_edit", "text"),
+    ("auto_charge", "auto_charge_check", "bool"),
+    ("overwrite", "overwrite_check", "bool"),
+    ("prepare_workers", "prepare_workers_spin", "int"),
+    ("mopac_workers", "mopac_workers_spin", "int"),
+    ("export_workers", "export_workers_spin", "int"),
+    ("obabel_timeout", "obabel_timeout_spin", "int"),
+    ("mopac_timeout", "mopac_timeout_spin", "int"),
+    ("export_timeout", "export_timeout_spin", "int"),
+    ("retry_obabel_timeout", "retry_obabel_timeout_spin", "int"),
+    ("retry_mopac_timeout", "retry_mopac_timeout_spin", "int"),
+    ("retry_keywords", "retry_keywords_edit", "text"),
+    ("copy_sdf", "copy_sdf_check", "bool"),
+    ("sdf_catalogue", "sdf_catalogue_edit", "text"),
+)
+
+# sdf_catalogue_edit is excluded: its enabled state is owned by
+# copy_sdf_check (see _build_settings_group), so the lock must not set it
+# blindly -- see _on_toggle_settings_lock_clicked.
+_LOCKABLE_SETTINGS: tuple[str, ...] = tuple(
+    attr for _, attr, _ in _SETTINGS_FIELDS if attr != "sdf_catalogue_edit"
+)
+
+# Phase name -> workspace phase key. The phase names are the same magic
+# strings _poll_worker already dispatches on. "Retry Failed" maps to the
+# MOPAC phase because that is the CSV it rewrites, and "Scan" is a
+# pseudo-phase with no results of its own.
+_PHASE_TO_WORKSPACE_KEY = {
+    "Prepare": "prepare",
+    "Run MOPAC": "mopac",
+    "Export SDF": "export",
+    "Retry Failed": "mopac",
+}
+_SCAN_PHASE_NAME = "Scan"
 
 # Seconds a running phase gets to wind down after the window is closed before
 # the process exits regardless. See MainWindow.closeEvent.
@@ -67,7 +127,7 @@ PROVENANCE_PATH = Path(__file__).resolve().parent / "provenance.json"
 # malformed so a broken/deleted provenance file can't stop the app launching.
 _DEFAULT_PROVENANCE = {
     "author": "Maciej Gromelski",
-    "version": "1.2.0",
+    "version": "1.3.0",
     "year": 2026,
     "contact_email": "maciek.gromelski@gmail.com",
 }
@@ -100,6 +160,58 @@ QWidget {
     color: #303841;
     font-family: "Segoe UI", Arial, sans-serif;
     font-size: 13px;
+}
+
+/* ============================================================
+   Menu bar (see MainWindow._build_menu_bar()). Without these rules the
+   menus fall through to the generic QWidget rule above -- a flat bar and
+   a borderless popup with no hover feedback.
+
+   The bottom border is deliberately a quiet 1px grey, NOT another orange
+   rule: headerBar's 2px #FF5722 border-bottom sits directly underneath
+   and has to stay the page's dominant divider.
+   ============================================================ */
+QMenuBar {
+    background-color: #F5F5F5;
+    color: #303841;
+    border-bottom: 1px solid #DADADA;
+    padding: 2px 8px;
+}
+QMenuBar::item {
+    background: transparent;
+    padding: 5px 12px;
+    border-radius: 4px;
+}
+QMenuBar::item:selected {
+    background-color: #D9EBEC;
+    color: #185861;
+}
+QMenuBar::item:pressed {
+    background-color: #76ABAE;
+    color: #F5F5F5;
+}
+QMenu {
+    background-color: #FFFFFF;
+    color: #303841;
+    border: 1px solid #C7D3D4;
+    border-radius: 6px;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 6px 28px 6px 20px;
+    border-radius: 4px;
+}
+QMenu::item:selected {
+    background-color: #76ABAE;
+    color: #F5F5F5;
+}
+QMenu::item:disabled {
+    color: #9AA0A2;
+}
+QMenu::separator {
+    height: 1px;
+    background-color: #DDE4E4;
+    margin: 4px 10px;
 }
 
 /* ============================================================
@@ -393,6 +505,16 @@ QLabel#footerLabel {
     font-size: 11px;
     padding: 2px 10px;
 }
+/* Left-hand status bar slot -- which workspace is loaded and when it was
+   last written. Teal rather than the footer's grey so "your work is saved"
+   reads as live state, not chrome. */
+QLabel#workspaceLabel {
+    background: transparent;
+    color: #185861;
+    font-size: 11px;
+    font-weight: 600;
+    padding: 2px 10px;
+}
 """
 
 
@@ -495,11 +617,40 @@ class MainWindow(QMainWindow):
         self._last_batch_df: pd.DataFrame | None = None
         self._cancel_event: threading.Event = threading.Event()
 
+        # One timer for the lifetime of the window, started/stopped per
+        # phase. It used to be constructed inside _start_phase, which left a
+        # dead QTimer child parented to the window after every run.
+        self._poll_timer = QTimer(self)
+        self._poll_timer.setInterval(150)
+        self._poll_timer.timeout.connect(self._poll_worker)
+
+        # --- Workspace state ------------------------------------------
+        # _input_path exists because until now the input file's path lived
+        # only as input_path_label's text, which is not something a save
+        # routine should be reading back out of a widget.
+        self._workspace: dict = ws.new_workspace(PROVENANCE["version"])
+        self._workspace_path: Path | None = None
+        self._input_path: Path | None = None
+        # Set for the duration of a restore so _on_workdir_changed's
+        # "invalidate everything" behaviour cannot undo what we just applied.
+        self._restoring: bool = False
+        self._committing_workdir: bool = False
+        # Workspaces the user has already declined to restore this session.
+        self._declined_restores: set[Path] = set()
+        # Cached results of the cheap */*.mop and */*.arc probes, so
+        # _update_button_states (called on every keystroke) never touches
+        # the filesystem itself. Refreshed by _refresh_disk_state().
+        self._disk_has_mop: bool = False
+        self._disk_has_arc: bool = False
+        self._qsettings = QSettings(_ORG_NAME, _APP_NAME)
+
         self._build_ui()
+        self._build_menu_bar()
         self._build_footer()
         self._update_button_states()
         self._attach_logging()
         self._check_environment()
+        self._refresh_disk_state()
 
     # ------------------------------------------------------------------
     # UI construction
@@ -551,7 +702,162 @@ class MainWindow(QMainWindow):
 
         return col
 
+    def _build_menu_bar(self) -> None:
+        """Application menu bar: File / Run / Tools / Help.
+
+        Attached from __init__ rather than from _build_ui() because
+        QMainWindow reserves its own band for it above the central widget --
+        same reason _build_footer() is separate.
+
+        The Run menu deliberately reuses the *same slots* as the workflow
+        buttons rather than duplicating any logic, and its actions are
+        enabled/disabled from _update_button_states(), which stays the sole
+        place that decides what is runnable.
+        """
+        menubar = self.menuBar()
+
+        # -- File ------------------------------------------------------
+        file_menu = menubar.addMenu("&File")
+
+        self.act_open_ws = QAction("&Open Workspace…", self)
+        self.act_open_ws.setShortcut(QKeySequence.Open)
+        self.act_open_ws.triggered.connect(self._on_open_workspace)
+        file_menu.addAction(self.act_open_ws)
+
+        self.recent_menu = QMenu("&Recent Workspaces", self)
+        # Rebuilt on demand: the list can be changed by another window or by
+        # this one between openings, and it is cheap to regenerate.
+        self.recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
+        file_menu.addMenu(self.recent_menu)
+
+        self.act_save_ws = QAction("&Save Workspace", self)
+        self.act_save_ws.setShortcut(QKeySequence.Save)
+        self.act_save_ws.triggered.connect(self._on_save_workspace)
+        file_menu.addAction(self.act_save_ws)
+
+        self.act_save_ws_as = QAction("Save Workspace &As…", self)
+        self.act_save_ws_as.setShortcut(QKeySequence.SaveAs)
+        self.act_save_ws_as.triggered.connect(self._on_save_workspace_as)
+        file_menu.addAction(self.act_save_ws_as)
+
+        file_menu.addSeparator()
+
+        self.act_load_input = QAction("&Load Input File…", self)
+        self.act_load_input.setShortcut(QKeySequence("Ctrl+I"))
+        self.act_load_input.triggered.connect(self._on_browse_input)
+        file_menu.addAction(self.act_load_input)
+
+        self.act_close_ws = QAction("&Close Workspace", self)
+        self.act_close_ws.triggered.connect(self._on_close_workspace)
+        file_menu.addAction(self.act_close_ws)
+
+        file_menu.addSeparator()
+
+        self.act_exit = QAction("E&xit", self)
+        self.act_exit.setShortcut(QKeySequence("Ctrl+Q"))
+        # Routed through close() rather than QApplication.quit() so it goes
+        # through closeEvent, which cancels a running phase and arms the
+        # forced-exit watchdog.
+        self.act_exit.triggered.connect(self.close)
+        file_menu.addAction(self.act_exit)
+
+        # -- Run -------------------------------------------------------
+        run_menu = menubar.addMenu("&Run")
+
+        self.act_prepare = QAction("&1. Prepare (SMILES → .mop)", self)
+        self.act_prepare.setShortcut(QKeySequence("Ctrl+1"))
+        self.act_prepare.triggered.connect(self._on_prepare_clicked)
+        run_menu.addAction(self.act_prepare)
+
+        self.act_run_mopac = QAction("&2. Run MOPAC", self)
+        self.act_run_mopac.setShortcut(QKeySequence("Ctrl+2"))
+        self.act_run_mopac.triggered.connect(self._on_run_mopac_clicked)
+        run_menu.addAction(self.act_run_mopac)
+
+        self.act_export_sdf = QAction("&3. Export SDF", self)
+        self.act_export_sdf.setShortcut(QKeySequence("Ctrl+3"))
+        self.act_export_sdf.triggered.connect(self._on_export_sdf_clicked)
+        run_menu.addAction(self.act_export_sdf)
+
+        self.act_retry = QAction("Retry &Failed Jobs", self)
+        self.act_retry.setShortcut(QKeySequence("Ctrl+4"))
+        self.act_retry.triggered.connect(self._on_retry_failed_clicked)
+        run_menu.addAction(self.act_retry)
+
+        run_menu.addSeparator()
+
+        self.act_stop = QAction("&Stop", self)
+        self.act_stop.setShortcut(QKeySequence("Ctrl+."))
+        self.act_stop.triggered.connect(self._on_stop_clicked)
+        run_menu.addAction(self.act_stop)
+
+        # -- Tools -----------------------------------------------------
+        tools_menu = menubar.addMenu("&Tools")
+
+        self.act_check_env = QAction("Check &Environment", self)
+        self.act_check_env.triggered.connect(self._check_environment)
+        tools_menu.addAction(self.act_check_env)
+
+        self.act_scan_workdir = QAction("&Scan Working Directory", self)
+        self.act_scan_workdir.triggered.connect(self._on_scan_workdir)
+        tools_menu.addAction(self.act_scan_workdir)
+
+        tools_menu.addSeparator()
+
+        self.act_open_workdir = QAction("Open &Working Directory", self)
+        self.act_open_workdir.triggered.connect(
+            lambda: self._open_in_file_manager(self.workdir_edit.text())
+        )
+        tools_menu.addAction(self.act_open_workdir)
+
+        self.act_open_catalogue = QAction("Open SDF &Catalogue", self)
+        self.act_open_catalogue.triggered.connect(
+            lambda: self._open_in_file_manager(self.sdf_catalogue_edit.text())
+        )
+        tools_menu.addAction(self.act_open_catalogue)
+
+        tools_menu.addSeparator()
+
+        self.act_clear_log = QAction("Clear &Log", self)
+        self.act_clear_log.triggered.connect(self.log_view.clear)
+        tools_menu.addAction(self.act_clear_log)
+
+        # -- Help ------------------------------------------------------
+        help_menu = menubar.addMenu("&Help")
+
+        self.act_docs = QAction("&Documentation (README)", self)
+        self.act_docs.triggered.connect(
+            lambda: self._open_in_file_manager(README_PATH)
+        )
+        help_menu.addAction(self.act_docs)
+
+        self.act_about = QAction("&About", self)
+        self.act_about.triggered.connect(self._on_about)
+        help_menu.addAction(self.act_about)
+
+    def _rebuild_recent_menu(self) -> None:
+        """Repopulate File ▸ Recent Workspaces from QSettings."""
+        self.recent_menu.clear()
+        recent = self._recent_workspaces()
+        if not recent:
+            placeholder = self.recent_menu.addAction("(none yet)")
+            placeholder.setEnabled(False)
+            return
+        for path_text in recent:
+            action = self.recent_menu.addAction(path_text)
+            # default arg binds the current value, not the loop variable
+            action.triggered.connect(
+                lambda _checked=False, p=path_text: self._open_workspace(Path(p))
+            )
+
     def _build_footer(self) -> None:
+        # Left slot: live workspace state. Right slot (permanent): static
+        # provenance. Keeping them on opposite ends stops the workspace text
+        # from shifting the credit line around as it updates.
+        self.workspace_label = QLabel("Workspace: (none)")
+        self.workspace_label.setObjectName("workspaceLabel")
+        self.statusBar().addWidget(self.workspace_label)
+
         footer_label = QLabel(
             f"Created by {PROVENANCE['author']}   |   v{PROVENANCE['version']}   |   "
             f"© {PROVENANCE['year']}   |   {PROVENANCE['contact_email']}"
@@ -626,7 +932,12 @@ class MainWindow(QMainWindow):
         group = QGroupBox("Working Directory")
         row = QHBoxLayout(group)
         self.workdir_edit = QLineEdit("mopac_jobs")
+        # textChanged invalidates session state on every keystroke;
+        # editingFinished is where the (comparatively expensive) filesystem
+        # probe and the workspace auto-detect happen, so neither runs
+        # mid-typing.
         self.workdir_edit.textChanged.connect(self._on_workdir_changed)
+        self.workdir_edit.editingFinished.connect(self._on_workdir_committed)
         self.browse_workdir_button = QPushButton("Browse...")
         self.browse_workdir_button.clicked.connect(self._on_browse_workdir)
         row.addWidget(self.workdir_edit, stretch=1)
@@ -822,27 +1133,43 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Select input file",
-            "",
+            str(self._input_path.parent) if self._input_path else "",
             "Excel/CSV Files (*.xlsx *.csv);;Excel Files (*.xlsx);;"
             "CSV Files (*.csv);;All Files (*)",
         )
-        if not path:
-            return
+        if path:
+            self._load_input_file(Path(path))
+
+    def _load_input_file(self, path: Path, reset_phases: bool = True) -> bool:
+        """Read an .xlsx/.csv into self.df and repopulate the column combos.
+
+        Split out of _on_browse_input so the browse button, File ▸ Load Input
+        File… and workspace restore all go through exactly one implementation
+        of "load this spreadsheet".
+
+        reset_phases=False is used by restore, which sets the phase flags
+        itself from the workspace and the results CSVs -- clearing them here
+        would immediately undo that.
+
+        Returns True when the file loaded.
+        """
         try:
-            if path.lower().endswith(".csv"):
+            if path.suffix.lower() == ".csv":
                 df = pd.read_csv(path)
             else:
                 df = pd.read_excel(path)
         except Exception as exc:  # noqa: BLE001
             QMessageBox.critical(self, "Failed to load file", str(exc))
-            return
+            return False
 
         self.df = df
-        self.input_path_label.setText(path)
-        self._prepare_succeeded = False
-        self._mopac_succeeded = False
-        self._last_prepare_df = None
-        self._last_batch_df = None
+        self._input_path = path
+        self.input_path_label.setText(str(path))
+        if reset_phases:
+            self._prepare_succeeded = False
+            self._mopac_succeeded = False
+            self._last_prepare_df = None
+            self._last_batch_df = None
 
         self.smiles_col_combo.clear()
         self.smiles_col_combo.addItems([str(c) for c in df.columns])
@@ -853,18 +1180,51 @@ class MainWindow(QMainWindow):
             self.id_col_combo.addItem(str(col), str(col))
 
         self._update_button_states()
+        return True
 
     def _on_browse_workdir(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select working directory")
         if path:
             self.workdir_edit.setText(path)
+            self._on_workdir_committed()
 
     def _on_workdir_changed(self, _text: str) -> None:
+        """Invalidate in-session phase progress when the workdir is retyped.
+
+        Fires on every keystroke, so it stays deliberately cheap and does not
+        touch the filesystem -- the disk probe lives in _on_workdir_committed,
+        wired to editingFinished instead.
+        """
+        if self._restoring:
+            return
         self._prepare_succeeded = False
         self._mopac_succeeded = False
         self._last_prepare_df = None
         self._last_batch_df = None
+        self._disk_has_mop = False
+        self._disk_has_arc = False
         self._update_button_states()
+
+    def _on_workdir_committed(self) -> None:
+        """The user finished typing/picking a working directory.
+
+        Re-probes what is on disk (which is what re-enables the later phase
+        buttons for a folder prepared in an earlier session) and offers to
+        restore a workspace file if the folder has one.
+
+        Guarded against re-entry: editingFinished fires on focus-out, and
+        opening a modal from inside it can move focus enough to emit the
+        signal a second time -- which would stack a duplicate dialog.
+        """
+        if self._restoring or self._committing_workdir:
+            return
+        self._committing_workdir = True
+        try:
+            self._refresh_disk_state()
+            self._update_button_states()
+            self._maybe_offer_restore()
+        finally:
+            self._committing_workdir = False
 
     def _on_browse_catalogue(self) -> None:
         path = QFileDialog.getExistingDirectory(self, "Select SDF catalogue folder")
@@ -886,23 +1246,8 @@ class MainWindow(QMainWindow):
         lock = not self._settings_locked
         self._settings_locked = lock
 
-        widgets = [
-            self.keywords_edit,
-            self.auto_charge_check,
-            self.overwrite_check,
-            self.prepare_workers_spin,
-            self.mopac_workers_spin,
-            self.export_workers_spin,
-            self.obabel_timeout_spin,
-            self.mopac_timeout_spin,
-            self.export_timeout_spin,
-            self.retry_obabel_timeout_spin,
-            self.retry_mopac_timeout_spin,
-            self.retry_keywords_edit,
-            self.copy_sdf_check,
-        ]
-        for widget in widgets:
-            widget.setEnabled(not lock)
+        for attr in _LOCKABLE_SETTINGS:
+            getattr(self, attr).setEnabled(not lock)
 
         if lock:
             self.sdf_catalogue_edit.setEnabled(False)
@@ -932,6 +1277,527 @@ class MainWindow(QMainWindow):
             self.save_settings_button.setStyleSheet("")
 
         self._update_button_states()
+        if lock:
+            # Confirming the settings is the natural moment to persist them:
+            # from here on they are what the phases will actually run with.
+            self._save_workspace("settings confirmed")
+
+    # ------------------------------------------------------------------
+    # Workspace: collecting and applying state
+    # ------------------------------------------------------------------
+    def _collect_settings(self) -> dict:
+        """Read the Settings widgets into plain JSON-able values."""
+        values: dict = {}
+        for key, attr, kind in _SETTINGS_FIELDS:
+            widget = getattr(self, attr)
+            if kind == "text":
+                values[key] = widget.text()
+            elif kind == "bool":
+                values[key] = widget.isChecked()
+            else:
+                values[key] = widget.value()
+        return values
+
+    def _apply_settings(self, values: dict) -> None:
+        """Push saved values back into the Settings widgets.
+
+        Signals are blocked per widget so that restoring copy_sdf triggers
+        neither of the two setEnabled connections wired up in
+        _build_settings_group -- the lock state is applied separately, and
+        afterwards, by _apply_workspace.
+        """
+        for key, attr, kind in _SETTINGS_FIELDS:
+            if key not in values:
+                continue
+            widget = getattr(self, attr)
+            blocked = widget.blockSignals(True)
+            try:
+                if kind == "text":
+                    widget.setText(str(values[key]))
+                elif kind == "bool":
+                    widget.setChecked(bool(values[key]))
+                else:
+                    widget.setValue(int(values[key]))
+            except (TypeError, ValueError):
+                _runner_logger.warning(
+                    "Ignoring unusable saved value for %r: %r", key, values[key]
+                )
+            finally:
+                widget.blockSignals(blocked)
+
+    def _set_settings_locked(self, locked: bool) -> None:
+        """Force the lock into a given state, reusing the toggle's own logic."""
+        if self._settings_locked != locked:
+            self._on_toggle_settings_lock_clicked()
+
+    def _collect_workspace(self) -> dict:
+        """Snapshot everything worth persisting, on top of the current one.
+
+        Built by updating self._workspace rather than from scratch so the
+        per-phase history (states, timestamps, counts) accumulated across the
+        session survives each save.
+        """
+        data = self._workspace
+        data["app_version"] = PROVENANCE["version"]
+        data["workdir"] = self.workdir_edit.text()
+        data["settings"] = self._collect_settings()
+        data["settings_locked"] = self._settings_locked
+
+        source = dict(data.get("input") or {})
+        if self._input_path is not None:
+            source.update(ws.fingerprint_input(self._input_path))
+            source["path"] = str(self._input_path)
+            source["n_rows"] = int(len(self.df)) if self.df is not None else None
+            source["columns"] = (
+                [str(c) for c in self.df.columns] if self.df is not None else []
+            )
+        source["smiles_col"] = self.smiles_col_combo.currentText()
+        source["id_col"] = self.id_col_combo.currentData()
+        data["input"] = source
+        return data
+
+    def _record_phase(self, phase_name: str, state: str, df: pd.DataFrame | None = None) -> None:
+        """Update one phase's entry in the in-memory workspace.
+
+        Called at phase start with state="running" and at phase end with the
+        outcome. The "running" marker is the whole point of saving at the
+        start: a process killed 90 minutes into a two-hour Prepare reads back
+        as interrupted rather than as never having run.
+        """
+        key = _PHASE_TO_WORKSPACE_KEY.get(phase_name)
+        if key is None:
+            return
+        phase = self._workspace["phases"].setdefault(key, ws.new_phase(key))
+        phase["state"] = state
+        if state == ws.STATE_RUNNING:
+            phase["started_at"] = ws.now_iso()
+            phase["finished_at"] = None
+        else:
+            phase["finished_at"] = ws.now_iso()
+        if df is not None and "status" in df.columns:
+            phase["counts"] = {
+                str(status): int(count) for status, count in df["status"].value_counts().items()
+            }
+
+    # ------------------------------------------------------------------
+    # Workspace: saving
+    # ------------------------------------------------------------------
+    def _default_workspace_path(self) -> Path | None:
+        text = self.workdir_edit.text().strip()
+        return ws.workspace_path_for(text) if text else None
+
+    def _save_workspace(self, reason: str, path: Path | None = None) -> bool:
+        """Write the workspace, silently by default.
+
+        Autosave must never be able to interrupt the user, so a failure here
+        is a warning in the log console (and a note in the status bar) rather
+        than a modal -- losing the sidecar is recoverable, since the working
+        directory still holds every .mop/.out/.arc and the results CSVs.
+
+        Restoring is never a save: applying a workspace re-locks the Settings
+        section, and the lock autosaves, which would otherwise write the
+        half-applied state straight back over the file being read.
+        """
+        if self._restoring:
+            return False
+        target = path or self._workspace_path or self._default_workspace_path()
+        if target is None:
+            return False
+        try:
+            ws.save_workspace(target, self._collect_workspace())
+        except OSError as exc:
+            _runner_logger.warning("Could not save workspace to %s: %s", target, exc)
+            self.workspace_label.setText(f"Workspace: NOT saved — {exc.strerror or exc}")
+            return False
+
+        self._workspace_path = target
+        self._remember_recent(target)
+        self.workspace_label.setText(
+            f"Workspace: {target.parent.name or target.parent} — "
+            f"saved {ws.now_iso()[11:16]}"
+        )
+        _runner_logger.info("Workspace saved (%s): %s", reason, target)
+        return True
+
+    def _on_save_workspace(self) -> None:
+        if not self.workdir_edit.text().strip():
+            QMessageBox.warning(
+                self, "No working directory",
+                "Set a working directory first — the workspace file is saved inside it.",
+            )
+            return
+        self._save_workspace("manual save")
+
+    def _on_save_workspace_as(self) -> None:
+        """Export a copy of the workspace somewhere else.
+
+        Deliberately does NOT change where autosave writes: the canonical
+        copy stays at <workdir>/workspace.json so the working directory
+        remains self-describing. This is for sharing or archiving a setup.
+        """
+        start = self._default_workspace_path() or Path(ws.WORKSPACE_FILENAME)
+        path, _ = QFileDialog.getSaveFileName(
+            self, "Save workspace copy as", str(start), "Workspace JSON (*.json);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            ws.save_workspace(Path(path), self._collect_workspace())
+        except OSError as exc:
+            QMessageBox.critical(self, "Could not save workspace", str(exc))
+            return
+        _runner_logger.info("Workspace copy written to %s", path)
+
+    # ------------------------------------------------------------------
+    # Workspace: opening and restoring
+    # ------------------------------------------------------------------
+    def _on_open_workspace(self) -> None:
+        start = self.workdir_edit.text().strip() or ""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Open workspace", start, "Workspace JSON (*.json);;All Files (*)"
+        )
+        if path:
+            self._open_workspace(Path(path))
+
+    def _on_close_workspace(self) -> None:
+        """Detach from the current workspace without touching the disk."""
+        self._workspace = ws.new_workspace(PROVENANCE["version"])
+        self._workspace_path = None
+        self.workspace_label.setText("Workspace: (none)")
+        _runner_logger.info("Workspace closed (nothing was deleted).")
+
+    def _maybe_offer_restore(self) -> None:
+        """Offer to restore if the chosen working directory already has one."""
+        candidate = self._default_workspace_path()
+        if candidate is None or not candidate.is_file():
+            return
+        if self._workspace_path is not None and candidate == self._workspace_path:
+            return
+        # Saying no once means no: without this, simply clicking back into
+        # the working-directory field would re-ask every time.
+        if candidate in self._declined_restores:
+            return
+        try:
+            data = ws.load_workspace(candidate)
+        except ws.WorkspaceError as exc:
+            _runner_logger.warning("Ignoring unreadable workspace at %s: %s", candidate, exc)
+            return
+
+        answer = QMessageBox.question(
+            self,
+            "Saved workspace found",
+            f"{candidate} describes an earlier session.\n\n"
+            f"{ws.describe_workspace(data)}\n\nRestore it?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+        if answer == QMessageBox.Yes:
+            self._open_workspace(candidate, preloaded=data)
+        else:
+            self._declined_restores.add(candidate)
+
+    def _open_workspace(self, path: Path, preloaded: dict | None = None) -> None:
+        """Load a workspace file and put the window back into that state."""
+        if self._phase_running:
+            QMessageBox.warning(
+                self, "Phase running",
+                "Stop the running phase before opening another workspace.",
+            )
+            return
+        try:
+            data = preloaded if preloaded is not None else ws.load_workspace(path)
+        except ws.WorkspaceError as exc:
+            QMessageBox.critical(self, "Could not open workspace", str(exc))
+            return
+
+        if ws.is_future_version(data):
+            QMessageBox.warning(
+                self, "Newer workspace",
+                f"{path.name} was written by a newer version of this app "
+                f"(schema {data.get('schema_version')} vs {ws.SCHEMA_VERSION}). "
+                "Restoring it anyway; some settings may be ignored.",
+            )
+
+        resume = self._ask_resume_mode(data)
+        if resume is None:
+            return
+
+        self._restoring = True
+        try:
+            self._apply_workspace(data, resume=resume)
+        finally:
+            self._restoring = False
+
+        self._workspace = data
+        self._workspace_path = path
+        self._remember_recent(path)
+        self._refresh_disk_state()
+        self._update_button_states()
+        self.workspace_label.setText(
+            f"Workspace: {path.parent.name or path.parent} — restored"
+        )
+        _runner_logger.info("Workspace restored from %s", path)
+        self._start_scan(silent=True)
+
+    def _ask_resume_mode(self, data: dict) -> bool | None:
+        """Ask whether to resume (skip finished work) or restore verbatim.
+
+        This exists because of a genuine footgun: overwrite defaults to True
+        in this GUI while the library default is False. Restoring an
+        interrupted 20,000-compound Prepare and pressing Prepare again with
+        overwrite on would redo every one of the two hours already spent.
+        Resuming turns it off so finished compounds are skipped instead.
+
+        Returns True to resume, False to restore settings as saved, or None
+        if the user cancelled.
+        """
+        if not ws.has_unfinished_work(data):
+            return False
+
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Question)
+        box.setWindowTitle("Resume this workspace?")
+        box.setText("This workspace has unfinished or failed work.")
+        box.setInformativeText(
+            f"{ws.describe_workspace(data)}\n\n"
+            "“Resume” turns Overwrite off, so compounds that already have "
+            "their .mop/.out/.sdf files are skipped instead of being redone."
+        )
+        resume_button = box.addButton("Resume — skip completed", QMessageBox.AcceptRole)
+        as_saved_button = box.addButton("Restore settings as saved", QMessageBox.AcceptRole)
+        box.addButton(QMessageBox.Cancel)
+        box.setDefaultButton(resume_button)
+        box.exec()
+
+        clicked = box.clickedButton()
+        if clicked is resume_button:
+            return True
+        if clicked is as_saved_button:
+            return False
+        return None
+
+    def _apply_workspace(self, data: dict, resume: bool) -> None:
+        """Put every restorable piece of *data* back into the window.
+
+        Runs with self._restoring set, so the workdir field's per-keystroke
+        invalidation cannot wipe the phase flags this sets.
+        """
+        self.workdir_edit.setText(str(data.get("workdir") or ""))
+        self._apply_settings(data.get("settings") or {})
+        if resume:
+            self.overwrite_check.setChecked(False)
+            _runner_logger.info(
+                "Resuming: Overwrite turned off so finished compounds are skipped."
+            )
+        # Re-apply copy_sdf's dependency by hand -- _apply_settings blocked
+        # the signal that normally does this.
+        catalogue_enabled = self.copy_sdf_check.isChecked()
+        self.sdf_catalogue_edit.setEnabled(catalogue_enabled)
+        self.browse_catalogue_button.setEnabled(catalogue_enabled)
+
+        self._restore_input(data)
+        self._set_settings_locked(bool(data.get("settings_locked")))
+        self._restore_phase_results(data)
+
+    def _restore_input(self, data: dict) -> None:
+        """Reload the recorded input file and re-select its columns.
+
+        Three outcomes worth calling out:
+          * file present and unchanged  -> silent, everything works;
+          * file moved/renamed          -> offer to locate it;
+          * file edited since the save  -> warn, because compound IDs are
+            derived from the whole DataFrame in order (_build_job_list in
+            mopac_batch_runner.py) and retry_failed_batch re-derives them, so
+            a reordered sheet maps compounds onto the wrong directories.
+
+        Declining to supply the file is a supported outcome, not a failure:
+        Run MOPAC and Export SDF read the working directory alone, so they
+        stay usable. Only Prepare and Retry need the spreadsheet.
+        """
+        source = data.get("input") or {}
+        path_text = source.get("path")
+        if not path_text:
+            return
+
+        path = Path(path_text)
+        if not path.is_file():
+            answer = QMessageBox.question(
+                self,
+                "Input file not found",
+                f"The workspace refers to:\n{path}\n\nIt is no longer there. "
+                "Locate it now?\n\n(Without it you can still run MOPAC and "
+                "export SDFs — only Prepare and Retry need the spreadsheet.)",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                return
+            picked, _ = QFileDialog.getOpenFileName(
+                self, "Locate input file", str(path.parent),
+                "Excel/CSV Files (*.xlsx *.csv);;All Files (*)",
+            )
+            if not picked:
+                return
+            path = Path(picked)
+
+        if not self._load_input_file(path, reset_phases=False):
+            return
+
+        if not ws.input_matches(source, ws.fingerprint_input(path)):
+            QMessageBox.warning(
+                self,
+                "Input file has changed",
+                f"{path.name} is not the file this workspace was saved with.\n\n"
+                "Compound IDs are rebuilt from the whole spreadsheet in row "
+                "order, so if rows were added, removed or reordered, Retry "
+                "Failed Jobs can match compounds to the wrong job folders.\n\n"
+                "Preparing into a fresh working directory is the safe option.",
+            )
+
+        smiles_col = source.get("smiles_col")
+        if smiles_col:
+            index = self.smiles_col_combo.findText(str(smiles_col))
+            if index >= 0:
+                self.smiles_col_combo.setCurrentIndex(index)
+        id_index = self.id_col_combo.findData(source.get("id_col"))
+        if id_index >= 0:
+            self.id_col_combo.setCurrentIndex(id_index)
+
+    def _restore_phase_results(self, data: dict) -> None:
+        """Reload the per-phase results CSVs and re-enable the phases they prove.
+
+        The CSVs are the authority on *what happened*; the workspace is the
+        authority on *what was configured*. A phase counts as having run if
+        its CSV is on disk, whatever the workspace claims -- that way a
+        directory processed through the Python API still restores usefully.
+        """
+        workdir = Path(self.workdir_edit.text().strip() or ".")
+        loaded: list[tuple[str, pd.DataFrame]] = []
+
+        for key, label in (("prepare", "Prepare"), ("mopac", "Run MOPAC"), ("export", "Export SDF")):
+            csv_path = workdir / ws.PHASE_RESULT_CSV[key]
+            if not csv_path.is_file():
+                continue
+            try:
+                df = pd.read_csv(csv_path)
+            except (OSError, ValueError) as exc:
+                _runner_logger.warning("Could not read %s: %s", csv_path, exc)
+                continue
+            loaded.append((label, df))
+            if key == "prepare":
+                self._prepare_succeeded = True
+                self._last_prepare_df = df
+            elif key == "mopac":
+                self._mopac_succeeded = True
+                self._last_batch_df = df
+
+        if loaded:
+            label, df = loaded[-1]
+            self._populate_table(df)
+            self._update_summary_label(f"{label} (restored)", df)
+        else:
+            self.summary_label.setText(
+                "Workspace restored — no results CSV found in the working directory yet."
+            )
+
+    # ------------------------------------------------------------------
+    # Workspace: recent list
+    # ------------------------------------------------------------------
+    def _recent_workspaces(self) -> list[str]:
+        stored = self._qsettings.value(_RECENT_KEY, [])
+        if isinstance(stored, str):  # QSettings collapses one-element lists
+            stored = [stored]
+        return [p for p in (stored or []) if p]
+
+    def _remember_recent(self, path: Path) -> None:
+        text = str(path)
+        recent = [p for p in self._recent_workspaces() if p != text]
+        recent.insert(0, text)
+        self._qsettings.setValue(_RECENT_KEY, recent[:_MAX_RECENT])
+
+    # ------------------------------------------------------------------
+    # Working-directory inspection
+    # ------------------------------------------------------------------
+    def _refresh_disk_state(self) -> None:
+        """Probe whether the working directory already holds .mop / .arc files.
+
+        This is what lets a folder prepared in an earlier session (or by the
+        notebook, or by the Python API) unlock Run MOPAC and Export SDF
+        without re-running Prepare -- the library has always supported it,
+        since run_mopac_batch globs */*.mop and export_sdf globs */*.arc.
+
+        next(glob) short-circuits on the first match, so this stays cheap
+        even against a 20,000-folder working directory.
+        """
+        text = self.workdir_edit.text().strip()
+        workdir = Path(text) if text else None
+        if workdir is None or not workdir.is_dir():
+            self._disk_has_mop = False
+            self._disk_has_arc = False
+            return
+        try:
+            self._disk_has_mop = next(workdir.glob("*/*.mop"), None) is not None
+            self._disk_has_arc = next(workdir.glob("*/*.arc"), None) is not None
+        except OSError:
+            self._disk_has_mop = False
+            self._disk_has_arc = False
+
+    def _on_scan_workdir(self) -> None:
+        self._start_scan(silent=False)
+
+    def _start_scan(self, silent: bool) -> None:
+        """Count the artefacts actually on disk, on a background thread.
+
+        Worth doing on restore rather than trusting the results CSVs: those
+        are only rewritten every 200 completed jobs (_CHECKPOINT_EVERY in
+        mopac_batch_runner.py), so after a hard exit they can be missing up
+        to 199 compounds whose files are sitting in the working directory.
+
+        Runs as a pseudo-phase through the existing _start_phase machinery so
+        it inherits the progress bar, the STOP button and the button gating,
+        instead of introducing a second background-work pattern.
+        """
+        if self._phase_running:
+            if not silent:
+                QMessageBox.information(
+                    self, "Busy", "Wait for the current phase to finish, then scan."
+                )
+            return
+        text = self.workdir_edit.text().strip()
+        if not text or not Path(text).is_dir():
+            if not silent:
+                QMessageBox.warning(
+                    self, "No working directory", f"{text or '(empty)'} is not a directory."
+                )
+            return
+        self._start_phase(ws.scan_workdir, {"workdir": text}, _SCAN_PHASE_NAME)
+
+    def _apply_scan_result(self, scan: dict) -> None:
+        self._workspace["workdir_scan"] = scan
+        self.summary_label.setText(ws.describe_scan(scan))
+        _runner_logger.info(ws.describe_scan(scan))
+
+    # ------------------------------------------------------------------
+    # Misc menu actions
+    # ------------------------------------------------------------------
+    @staticmethod
+    def _open_in_file_manager(target: "str | Path") -> None:
+        path = Path(str(target).strip())
+        if not str(path) or not path.exists():
+            _runner_logger.warning("Cannot open %s — it does not exist yet.", path)
+            return
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _on_about(self) -> None:
+        QMessageBox.about(
+            self,
+            "About SMILE and optimize",
+            f"<b>SMILE and optimize</b> v{PROVENANCE['version']}<br><br>"
+            "Chemical structure optimization via MOPAC.<br>"
+            "SMILES → 3D (Open Babel) → MOPAC → SDF.<br><br>"
+            f"Created by {PROVENANCE['author']}<br>"
+            f"© {PROVENANCE['year']} — {PROVENANCE['contact_email']}",
+        )
 
     # ------------------------------------------------------------------
     # Phase actions
@@ -1048,6 +1914,14 @@ class MainWindow(QMainWindow):
         if self._phase_running:
             self._cancel_event.set()
             _runner_logger.info("Window closed -- stopping the running phase.")
+            # Whatever was running did not finish; record that before the
+            # snapshot, so a restore reports it as interrupted.
+            self._record_phase(self._current_phase_name, ws.STATE_STOPPED)
+
+        # A few kilobytes of JSON, written atomically -- cheap enough to do
+        # on the way out even when a phase is being force-killed behind us.
+        if self.workdir_edit.text().strip():
+            self._save_workspace("window closed")
 
         event.accept()
         super().closeEvent(event)
@@ -1087,21 +1961,52 @@ class MainWindow(QMainWindow):
         return bool(df["status"].isin(["failed", "timeout", "cancelled"]).any())
 
     def _update_button_states(self) -> None:
-        """Sole place that computes final enabled/disabled for the phase buttons."""
+        """Sole place that computes final enabled/disabled for the phase buttons.
+
+        Phases 2 and 3 unlock either from having run this session or from
+        what is already in the working directory (see _refresh_disk_state).
+        The library never needed the earlier phase to have run in-process --
+        run_mopac_batch discovers its work by globbing */*.mop and export_sdf
+        by globbing */*.arc -- so a directory left over from a previous
+        session, the notebook, or the Python API is picked up as-is.
+        """
         can_prepare = (
             self.df is not None
             and bool(self.smiles_col_combo.currentText())
             and self._settings_locked
         )
         self.prepare_button.setEnabled(can_prepare and not self._phase_running)
-        self.run_mopac_button.setEnabled(self._prepare_succeeded and not self._phase_running)
-        self.export_sdf_button.setEnabled(self._mopac_succeeded and not self._phase_running)
+        self.run_mopac_button.setEnabled(
+            (self._prepare_succeeded or self._disk_has_mop) and not self._phase_running
+        )
+        self.export_sdf_button.setEnabled(
+            (self._mopac_succeeded or self._disk_has_arc) and not self._phase_running
+        )
         self.stop_button.setEnabled(self._phase_running)
 
-        can_retry = self._mopac_succeeded and (
-            self._has_failures(self._last_prepare_df) or self._has_failures(self._last_batch_df)
+        # Retry rebuilds compound IDs from the input DataFrame, so unlike the
+        # two phases above it genuinely cannot run without the spreadsheet.
+        can_retry = (
+            self.df is not None
+            and (self._mopac_succeeded or self._disk_has_mop)
+            and (
+                self._has_failures(self._last_prepare_df)
+                or self._has_failures(self._last_batch_df)
+            )
         )
         self.retry_failed_button.setEnabled(can_retry and not self._phase_running)
+
+        # Mirror onto the Run menu so the menu items and the buttons can
+        # never disagree about what is runnable.
+        for action, button in (
+            (self.act_prepare, self.prepare_button),
+            (self.act_run_mopac, self.run_mopac_button),
+            (self.act_export_sdf, self.export_sdf_button),
+            (self.act_retry, self.retry_failed_button),
+            (self.act_stop, self.stop_button),
+        ):
+            action.setEnabled(button.isEnabled())
+        self.act_scan_workdir.setEnabled(not self._phase_running)
 
     # ------------------------------------------------------------------
     # Threaded phase execution
@@ -1114,6 +2019,14 @@ class MainWindow(QMainWindow):
         self.progress_bar.setVisible(True)
         self._current_phase_name = phase_name
 
+        # Mark the phase as running *before* it starts, and persist that.
+        # This is what makes a 2-hour Prepare recoverable after a crash or a
+        # forced exit: the workspace on disk says "running", so the next
+        # session restores it as interrupted rather than as never-run.
+        if phase_name != _SCAN_PHASE_NAME:
+            self._record_phase(phase_name, ws.STATE_RUNNING)
+            self._save_workspace(f"{phase_name} started")
+
         # PhaseWorker.run() executes on a plain background thread and never
         # touches Qt directly; a QTimer on the GUI thread (_poll_worker)
         # checks worker.done instead of the worker emitting a signal back.
@@ -1124,10 +2037,6 @@ class MainWindow(QMainWindow):
         # entirely and was the version that held up under repeated testing.
         self._worker = PhaseWorker(func, kwargs)
         threading.Thread(target=self._worker.run, daemon=True).start()
-
-        self._poll_timer = QTimer(self)
-        self._poll_timer.setInterval(150)
-        self._poll_timer.timeout.connect(self._poll_worker)
         self._poll_timer.start()
 
     def _poll_worker(self) -> None:
@@ -1138,27 +2047,48 @@ class MainWindow(QMainWindow):
         self._poll_timer.stop()
         self._worker = None
         self.progress_bar.setVisible(False)
+        phase_name = self._current_phase_name
+        stopped = self._cancel_event.is_set()
 
         if worker.error is not None:
-            QMessageBox.critical(self, f"{self._current_phase_name} failed", worker.error)
+            QMessageBox.critical(self, f"{phase_name} failed", worker.error)
+        elif phase_name == _SCAN_PHASE_NAME:
+            # The scan is not a pipeline phase: it returns a counts dict, not
+            # a results DataFrame, so it never touches the results table.
+            self._apply_scan_result(worker.result or {})
         else:
             # "Succeeded" means the phase call itself didn't raise -- not
             # that every row succeeded. Partial per-row failure is normal
             # pipeline behavior and must not block progressing to the next
             # phase for the rows that did succeed.
-            if self._current_phase_name == "Prepare":
+            if phase_name == "Prepare":
                 self._prepare_succeeded = True
                 self._last_prepare_df = worker.result
-            elif self._current_phase_name == "Run MOPAC":
+            elif phase_name == "Run MOPAC":
                 self._mopac_succeeded = True
                 self._last_batch_df = worker.result
-            elif self._current_phase_name == "Retry Failed":
+            elif phase_name == "Retry Failed":
                 self._last_batch_df = worker.result
             self._populate_table(worker.result)
-            self._update_summary_label(self._current_phase_name, worker.result)
-            if self._cancel_event.is_set():
+            self._update_summary_label(phase_name, worker.result)
+            if stopped:
                 self.summary_label.setText(self.summary_label.text() + "  (stopped by user)")
 
+        if phase_name != _SCAN_PHASE_NAME:
+            # Anything short of "ran to the end without being cancelled"
+            # counts as unfinished, so a restore offers to resume it.
+            finished_cleanly = worker.error is None and not stopped
+            self._record_phase(
+                phase_name,
+                ws.STATE_COMPLETED if finished_cleanly else ws.STATE_STOPPED,
+                worker.result,
+            )
+
+        # A finished phase has usually changed what is on disk -- Prepare
+        # creates the .mop files that unlock Run MOPAC, MOPAC creates the
+        # .arc files that unlock Export SDF.
+        self._refresh_disk_state()
+        self._save_workspace(f"{phase_name} finished")
         self._set_phase_buttons_enabled(False)
 
     # ------------------------------------------------------------------
