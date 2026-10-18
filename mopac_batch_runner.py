@@ -395,6 +395,7 @@ def run_command(
     timeout: Optional[int] = None,
     log_file: Optional[Path] = None,
     cancel_event: Optional[threading.Event] = None,
+    env: Optional[dict[str, str]] = None,
 ) -> CommandResult:
     """Execute an external command and capture its output.
 
@@ -422,6 +423,8 @@ def run_command(
         cancel_event: When set (from another thread) while the process is
                       running, it is killed immediately instead of being
                       allowed to run to completion or to *timeout*.
+        env:          Environment for the child process. ``None`` inherits
+                      the current process environment unchanged.
 
     Returns:
         :class:`CommandResult` with ``returncode``, ``stdout``, ``stderr``,
@@ -438,6 +441,7 @@ def run_command(
     proc = subprocess.Popen(
         cmd,
         cwd=cwd,
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
@@ -949,10 +953,53 @@ def write_mop_file(
 # ---------------------------------------------------------------------------
 
 
+def resolve_mopac_threads(threads: Optional[int], max_workers: int = 1) -> int:
+    """Decide how many CPU threads each MOPAC process may use.
+
+    MOPAC is built with OpenMP and, left alone, opens one thread per CPU
+    core in *every* process. With ``max_workers`` processes running at
+    once that oversubscribes the machine ``max_workers``-fold (e.g. 4
+    workers on 32 cores = 128 busy threads), and the threads spend most
+    of their time waiting on each other: small molecules that should take
+    seconds take minutes. Dividing the cores between the workers removes
+    the contention.
+
+    Args:
+        threads:     Explicit thread count per MOPAC process. ``None`` or
+                     ``0`` = automatic.
+        max_workers: Number of MOPAC processes that will run concurrently.
+
+    Returns:
+        *threads* if it is a positive integer, otherwise
+        ``max(1, cpu_count // max_workers)``.
+    """
+    if threads is not None and threads > 0:
+        return int(threads)
+    cores = os.cpu_count() or 1
+    return max(1, cores // max(1, max_workers))
+
+
+def _mopac_env(threads: int) -> dict[str, str]:
+    """Child-process environment that caps MOPAC at *threads* threads.
+
+    ``OMP_NUM_THREADS`` is what MOPAC's OpenMP runtime reads; the MKL /
+    OpenBLAS variables cover the linear-algebra backend some builds link
+    against. Equivalent to adding ``THREADS=<n>`` to the MOPAC keyword
+    line, but without touching the ``.mop`` files.
+    """
+    env = os.environ.copy()
+    value = str(int(threads))
+    env["OMP_NUM_THREADS"] = value
+    env["MKL_NUM_THREADS"] = value
+    env["OPENBLAS_NUM_THREADS"] = value
+    return env
+
+
 def run_mopac(
     mop_file: Path,
     timeout: Optional[int] = 600,
     cancel_event: Optional[threading.Event] = None,
+    threads: Optional[int] = None,
 ) -> CommandResult:
     """Run MOPAC on a single ``.mop`` input file.
 
@@ -966,6 +1013,9 @@ def run_mopac(
         timeout:      Seconds before MOPAC is killed; ``None`` = no limit.
         cancel_event: When set from another thread, MOPAC is killed
                       immediately. See :func:`run_command`.
+        threads:      CPU threads MOPAC may use for this run. ``None`` =
+                      inherit the caller's environment (MOPAC's own default
+                      is every core). See :func:`resolve_mopac_threads`.
 
     Returns:
         :class:`CommandResult` with ``returncode``, ``stdout``, ``stderr``,
@@ -977,6 +1027,7 @@ def run_mopac(
         timeout=timeout,
         log_file=mop_file.parent / "mopac_process.log",
         cancel_event=cancel_event,
+        env=_mopac_env(threads) if threads else None,
     )
 
 
@@ -1303,6 +1354,7 @@ def _run_mopac_one(
     timeout: Optional[int] = 600,
     overwrite: bool = False,
     cancel_event: Optional[threading.Event] = None,
+    threads: Optional[int] = None,
 ) -> JobResult:
     """Run MOPAC on a single prepared ``.mop`` file.
 
@@ -1317,6 +1369,8 @@ def _run_mopac_one(
                       with ``status="cancelled"`` without spawning MOPAC.
                       When set while MOPAC is running, it is killed
                       immediately.
+        threads:      CPU threads for this MOPAC process; see
+                      :func:`run_mopac`.
 
     Returns:
         :class:`JobResult` summarising the MOPAC run.
@@ -1349,7 +1403,9 @@ def _run_mopac_one(
 
     t0 = time.monotonic()
     logger.info("[%s] Running MOPAC ...", compound_id)
-    mopac_res = run_mopac(mop_file, timeout=timeout, cancel_event=cancel_event)
+    mopac_res = run_mopac(
+        mop_file, timeout=timeout, cancel_event=cancel_event, threads=threads,
+    )
 
     result.return_code = mopac_res.returncode
     result.duration = time.monotonic() - t0
@@ -1404,6 +1460,7 @@ def process_one_molecule(
     obabel_options: Optional[list[str]] = None,
     coord_format: str = OBABEL_3D_FORMAT,
     cancel_event: Optional[threading.Event] = None,
+    mopac_threads: Optional[int] = None,
 ) -> JobResult:
     """Execute the complete SMILES → 3D → MOPAC pipeline for one compound.
 
@@ -1465,6 +1522,7 @@ def process_one_molecule(
     # Phase 2: run MOPAC (always, since we just wrote a fresh .mop).
     result = _run_mopac_one(
         prep.mop_file, timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event,
+        threads=mopac_threads,
     )
     # Total duration = obabel time + MOPAC time.
     result.duration = (prep.duration or 0.0) + (result.duration or 0.0)
@@ -1902,6 +1960,7 @@ def run_mopac_batch(
     timeout: Optional[int] = 600,
     max_workers: int = 1,
     cancel_event: Optional[threading.Event] = None,
+    mopac_threads: Optional[int] = None,
 ) -> pd.DataFrame:
     """Phase 2 batch: run MOPAC on all ``.mop`` files found in *workdir*.
 
@@ -1922,6 +1981,11 @@ def run_mopac_batch(
                       any compound not yet started is skipped with
                       ``status="cancelled"`` and the in-flight MOPAC
                       process(es) (if any) are killed immediately.
+        mopac_threads: CPU threads per MOPAC process. ``None``/``0`` =
+                      automatic: the machine's cores divided by
+                      *max_workers* (at least 1), so the workers together
+                      use the whole machine without oversubscribing it.
+                      See :func:`resolve_mopac_threads`.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``
@@ -1958,7 +2022,14 @@ def run_mopac_batch(
 
     logger.info("Found %d .mop file(s) in %s.", n, workdir)
 
-    run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
+    threads = resolve_mopac_threads(mopac_threads, max_workers)
+    logger.info(
+        "MOPAC threads per process: %d (%d worker(s), %d CPU core(s)).",
+        threads, max_workers, os.cpu_count() or 1,
+    )
+    run_kwargs = dict(
+        timeout=timeout, overwrite=overwrite, cancel_event=cancel_event, threads=threads,
+    )
 
     columns = [
         "compound_id", "smiles", "status",
@@ -2027,6 +2098,7 @@ def run_pipeline(
     auto_charge: bool = False,
     coord_format: str = OBABEL_3D_FORMAT,
     cancel_event: Optional[threading.Event] = None,
+    mopac_threads: Optional[int] = None,
 ) -> pd.DataFrame:
     """Combined pipeline: SMILES → Open Babel → MOPAC in a single call.
 
@@ -2055,6 +2127,9 @@ def run_pipeline(
                           with ``status="cancelled"`` and the in-flight
                           obabel/MOPAC process(es) (if any) are killed
                           immediately.
+        mopac_threads:    CPU threads per MOPAC process. ``None``/``0`` =
+                          cores divided by *max_workers*; see
+                          :func:`resolve_mopac_threads`.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``smiles``, ``status``,
@@ -2085,6 +2160,11 @@ def run_pipeline(
     )
     n = len(jobs)
 
+    threads = resolve_mopac_threads(mopac_threads, max_workers)
+    logger.info(
+        "MOPAC threads per process: %d (%d worker(s), %d CPU core(s)).",
+        threads, max_workers, os.cpu_count() or 1,
+    )
     run_kwargs = dict(
         overwrite=overwrite,
         obabel_timeout=obabel_timeout,
@@ -2092,6 +2172,7 @@ def run_pipeline(
         obabel_options=obabel_options,
         coord_format=coord_format,
         cancel_event=cancel_event,
+        mopac_threads=threads,
     )
 
     columns = [
@@ -2338,6 +2419,7 @@ def retry_failed_batch(
     retry_keywords: Optional[str] = None,
     max_workers: int = 1,
     cancel_event: Optional[threading.Event] = None,
+    mopac_threads: Optional[int] = None,
 ) -> pd.DataFrame:
     """Re-run compounds that failed, timed out, or were cancelled in a
     previous batch.
@@ -2395,6 +2477,9 @@ def retry_failed_batch(
                           with ``status="cancelled"`` and the in-flight
                           obabel/MOPAC process(es) (if any) are killed
                           immediately.
+        mopac_threads:    CPU threads per MOPAC process. ``None``/``0`` =
+                          cores divided by *max_workers*; see
+                          :func:`resolve_mopac_threads`.
 
     Returns:
         The updated ``batch_results.csv`` DataFrame (same schema as
@@ -2532,7 +2617,14 @@ def retry_failed_batch(
             "Retrying %d MOPAC-stage job(s) with timeout=%s.",
             len(mopac_target_jobs), mopac_timeout,
         )
-        run_kwargs = dict(timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event)
+        threads = resolve_mopac_threads(mopac_threads, max_workers)
+        logger.info(
+            "MOPAC threads per process: %d (%d worker(s), %d CPU core(s)).",
+            threads, max_workers, os.cpu_count() or 1,
+        )
+        run_kwargs = dict(
+            timeout=mopac_timeout, overwrite=True, cancel_event=cancel_event, threads=threads,
+        )
 
         def _make_mopac_failure(idx: int, message: str) -> JobResult:
             return JobResult(

@@ -88,6 +88,7 @@ _SETTINGS_FIELDS: tuple[tuple[str, str, str], ...] = (
     ("overwrite", "overwrite_check", "bool"),
     ("prepare_workers", "prepare_workers_spin", "int"),
     ("mopac_workers", "mopac_workers_spin", "int"),
+    ("mopac_threads", "mopac_threads_spin", "int"),
     ("export_workers", "export_workers_spin", "int"),
     ("obabel_timeout", "obabel_timeout_spin", "int"),
     ("mopac_timeout", "mopac_timeout_spin", "int"),
@@ -965,6 +966,21 @@ class MainWindow(QMainWindow):
         self.mopac_workers_spin = self._make_workers_spin()
         form.addRow("MOPAC workers:", self.mopac_workers_spin)
 
+        # MOPAC opens one OpenMP thread per core in *every* process, so N
+        # workers oversubscribe the machine N-fold unless capped. 0 = auto:
+        # cores // workers, which uses the whole machine without contention.
+        self.mopac_threads_spin = QSpinBox()
+        self.mopac_threads_spin.setRange(0, max(1, os.cpu_count() or 1))
+        self.mopac_threads_spin.setValue(0)
+        self.mopac_threads_spin.setSpecialValueText("auto (CPU cores / workers)")
+        self.mopac_threads_spin.setToolTip(
+            "CPU threads each MOPAC process may use.\n"
+            f"This machine has {os.cpu_count() or 1} cores. Keep "
+            "workers x threads at or below that.\n"
+            "0 = automatic: cores divided by MOPAC workers (recommended)."
+        )
+        form.addRow("MOPAC threads per job:", self.mopac_threads_spin)
+
         self.export_workers_spin = self._make_workers_spin()
         form.addRow("Export workers:", self.export_workers_spin)
 
@@ -1836,6 +1852,7 @@ class MainWindow(QMainWindow):
             overwrite=self.overwrite_check.isChecked(),
             timeout=self.mopac_timeout_spin.value(),
             max_workers=self.mopac_workers_spin.value(),
+            mopac_threads=self.mopac_threads_spin.value(),
         )
         self._start_phase(run_mopac_batch, kwargs, "Run MOPAC")
 
@@ -1877,6 +1894,7 @@ class MainWindow(QMainWindow):
             mopac_timeout=self.retry_mopac_timeout_spin.value(),
             retry_keywords=retry_keywords,
             max_workers=self.mopac_workers_spin.value(),
+            mopac_threads=self.mopac_threads_spin.value(),
         )
         self._start_phase(retry_failed_batch, kwargs, "Retry Failed")
 

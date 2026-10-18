@@ -88,7 +88,7 @@ py gui.py
 
 1. **Load input data** — under *1. Input Data*, click *Browse…* and pick an `.xlsx` or `.csv` file containing your compounds, then choose which column holds the SMILES strings and (optionally) which holds the compound IDs.
 2. **Set the working directory** — where all generated files (`.mop`, `.out`, `.arc`, `.sdf`, per-phase result CSVs) get written. Defaults to `mopac_jobs`.
-3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, Prepare/MOPAC/Export timeouts, retry-specific timeouts and an optional retry MOPAC keyword override (see *Retrying failed jobs* below), and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
+3. **Configure Settings** — MOPAC keywords, automatic RDKit-based charge detection, overwrite behaviour, per-phase worker counts, *MOPAC threads per job* (leave at *auto* — see [Choosing `max_workers`](#parallel-execution)), Prepare/MOPAC/Export timeouts, retry-specific timeouts and an optional retry MOPAC keyword override (see *Retrying failed jobs* below), and whether to also copy every successfully-exported `.sdf` into one flat "catalogue" folder for easy sharing.
 4. **Click SAVE SETTINGS** to lock the Settings section. It prevents changing keywords/workers/timeouts by accident mid-run, and it's also what unlocks the *1. Prepare* button. Click *EDIT SETTINGS* to unlock and make changes again. Locking also writes the current settings into the workspace file (see [Workspaces](#workspaces--resuming-a-session)).
 5. **Run the three phases in order:**
    - **1. Prepare (SMILES → .mop)**
@@ -299,6 +299,7 @@ run_mopac_batch(
     timeout: int | None = 600,
     max_workers: int = 1,
     cancel_event: threading.Event | None = None,
+    mopac_threads: int | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -313,6 +314,7 @@ Scans `<workdir>/*/*.mop` for prepared input files and submits each to MOPAC. Th
 | `timeout` | `int \| None` | `600` | Per-compound MOPAC timeout in seconds. `None` = no limit. |
 | `max_workers` | `int` | `1` | Number of parallel worker threads. |
 | `cancel_event` | `threading.Event \| None` | `None` | When set from another thread while this is running, any compound not yet started is skipped with `status="cancelled"` and the in-flight MOPAC process(es) (if any) are killed immediately. See [Cancelling a running batch](#cancelling-a-running-batch). |
+| `mopac_threads` | `int \| None` | `None` | CPU threads each MOPAC process may use. `None`/`0` = automatic: CPU cores ÷ `max_workers` (at least 1). See [Choosing `max_workers`](#parallel-execution). |
 
 **Returns**
 
@@ -437,6 +439,7 @@ retry_failed_batch(
     retry_keywords: str | None = None,
     max_workers: int = 1,
     cancel_event: threading.Event | None = None,
+    mopac_threads: int | None = None,
 ) -> pd.DataFrame
 ```
 
@@ -771,6 +774,21 @@ results = run_mopac_batch(
 - Keep it at or below the number of **physical CPU cores** — each MOPAC process is CPU-bound and spawning more workers than cores increases wall time rather than reducing it.
 - Memory scales linearly: a typical PM7 optimisation uses 50–200 MB; multiply by `max_workers` to estimate peak RAM.
 - `max_workers=1` (the default) is identical to sequential behaviour.
+
+**MOPAC threads vs. workers**
+
+MOPAC is built with OpenMP and, by default, opens **one thread per CPU core in every process it runs**. With `max_workers=4` on a 32-core machine that is 128 busy threads competing for 32 cores; they spend most of their time waiting on each other and a 20-atom PM7 optimisation that should take seconds takes ten minutes.
+
+`run_mopac_batch`, `run_pipeline` and `retry_failed_batch` therefore cap each MOPAC process through its environment (`OMP_NUM_THREADS`, plus the MKL/OpenBLAS equivalents). The cap is controlled by `mopac_threads` (the *MOPAC threads per job* field in the GUI):
+
+| `mopac_threads` | Effect |
+|---|---|
+| `None` / `0` (default, GUI *auto*) | CPU cores ÷ `max_workers`, at least 1. The workers together use the whole machine without oversubscribing it. |
+| `n > 0` | Exactly `n` threads per MOPAC process. Keep `max_workers × n` at or below the core count. |
+
+For typical drug-like molecules (up to a few hundred atoms) MOPAC gains little from multithreading, so **many workers × 1 thread** gives the best throughput — on 32 cores, `max_workers=28` finishes a 35-compound PFAS batch in half a minute. Reserve several threads per job (few workers) only for very large systems where a single optimisation is itself the bottleneck.
+
+Calling `run_mopac` directly (one file, no batch) leaves MOPAC's own default in place unless you pass `threads=`.
 
 **Progress logging** differs slightly between modes.  Sequential mode logs before each job starts:
 
