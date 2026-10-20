@@ -228,6 +228,11 @@ class SdfResult:
     status: str = "failed"  # success | failed | skipped | cancelled
     error_message: Optional[str] = None
     duration: Optional[float] = None
+    # Where the SDF's bond orders / formal charges come from:
+    #   "smiles"  - re-assigned from the input SMILES (RDKit template match)
+    #   "obabel"  - Open Babel's perception from the coordinates only
+    #   "obabel (<reason>)" - template fix was attempted but failed
+    bond_orders: Optional[str] = None
 
     def to_dict(self) -> dict:
         """Serialise to a flat dict suitable for a pandas DataFrame row."""
@@ -238,6 +243,7 @@ class SdfResult:
             "status": self.status,
             "error_message": self.error_message,
             "duration_s": round(self.duration, 3) if self.duration is not None else None,
+            "bond_orders": self.bond_orders,
         }
 
 
@@ -1055,12 +1061,139 @@ def _extract_final_geometry(arc_file: Path) -> Optional[str]:
     return text[idx + len(marker):].lstrip("\n")
 
 
+def _read_mop_smiles(mop_file: Path) -> Optional[str]:
+    """Return the SMILES recorded on line 2 of a ``.mop`` written by this module."""
+    try:
+        lines = mop_file.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return None
+    if len(lines) >= 2 and "SMILES:" in lines[1]:
+        smiles = lines[1].split("SMILES:", 1)[1].strip()
+        return smiles or None
+    return None
+
+
+def _assign_bond_orders_from_smiles(sdf_file: Path, smiles: str, title: str) -> str:
+    """Rewrite *sdf_file* with bond orders and formal charges taken from *smiles*.
+
+    Open Babel derives the SDF bond table from the optimised coordinates
+    alone, and that perception fails for hypervalent and charge-separated
+    groups: sulfonates/sulfates come out as four single S-O bonds, N-oxides
+    and quaternary ammoniums lose their formal charges, so the SDF is
+    chemically wrong even though the geometry is correct.
+
+    The original SMILES is known (it is stored in the ``.mop`` header), so
+    the correct bond table is simply copied from it onto the MOPAC
+    coordinates with RDKit's ``AssignBondOrdersFromTemplate``. Atom order
+    and coordinates are left untouched; only bond orders and charges
+    change.
+
+    Args:
+        sdf_file: The SDF written by Open Babel (hydrogens explicit).
+        smiles:   SMILES the ``.mop`` was generated from.
+        title:    Molecule title to write (the compound id).
+
+    Returns:
+        ``"smiles"`` on success, otherwise ``"obabel (<reason>)"`` and the
+        file is left as Open Babel wrote it.
+    """
+    try:
+        from rdkit import Chem, RDLogger  # lazy import — RDKit is optional
+    except ImportError:
+        return "obabel (rdkit not installed)"
+
+    RDLogger.DisableLog("rdApp.*")
+    template = Chem.MolFromSmiles(smiles)
+    if template is None:
+        return "obabel (SMILES not parsable by RDKit)"
+    template = Chem.AddHs(template)
+
+    mol = Chem.MolFromMolFile(str(sdf_file), removeHs=False, sanitize=False)
+    if mol is None:
+        return "obabel (SDF not parsable by RDKit)"
+    if mol.GetNumAtoms() != template.GetNumAtoms():
+        return (
+            f"obabel (atom count {mol.GetNumAtoms()} differs from SMILES "
+            f"{template.GetNumAtoms()})"
+        )
+
+    def _plain_graph(m: "Chem.Mol") -> "Chem.RWMol":
+        """Copy of *m* reduced to elements + connectivity (all single bonds,
+        no charges, radicals or aromatic flags) so two molecules can be
+        matched on which atoms are bonded, regardless of bond-order guesses."""
+        g = Chem.RWMol(m)
+        for bond in g.GetBonds():
+            bond.SetBondType(Chem.BondType.SINGLE)
+            bond.SetIsAromatic(False)
+        for atom in g.GetAtoms():
+            atom.SetIsAromatic(False)
+            atom.SetFormalCharge(0)
+            atom.SetNumRadicalElectrons(0)
+            atom.SetNoImplicit(True)
+        g.UpdatePropertyCache(strict=False)
+        return g
+
+    mapping = _plain_graph(mol).GetSubstructMatch(_plain_graph(template))
+    if len(mapping) != template.GetNumAtoms():
+        return "obabel (connectivity differs from SMILES)"
+
+    # mapping[i] is the SDF atom that corresponds to template atom i. Copy
+    # bond orders, formal charges and radical counts across; atom order and
+    # coordinates stay exactly as MOPAC/Open Babel produced them.
+    fixed = Chem.RWMol(mol)
+    for atom in fixed.GetAtoms():
+        atom.SetFormalCharge(0)
+        atom.SetNumRadicalElectrons(0)
+        atom.SetIsAromatic(False)
+        atom.SetNoImplicit(True)
+    for bond in fixed.GetBonds():
+        bond.SetIsAromatic(False)
+    for t_atom in template.GetAtoms():
+        m_atom = fixed.GetAtomWithIdx(mapping[t_atom.GetIdx()])
+        m_atom.SetFormalCharge(t_atom.GetFormalCharge())
+        m_atom.SetNumRadicalElectrons(t_atom.GetNumRadicalElectrons())
+    kekulized = Chem.Mol(template)
+    Chem.Kekulize(kekulized, clearAromaticFlags=True)
+    template_bonds: set[tuple[int, int]] = set()
+    for t_bond in kekulized.GetBonds():
+        i, j = mapping[t_bond.GetBeginAtomIdx()], mapping[t_bond.GetEndAtomIdx()]
+        m_bond = fixed.GetBondBetweenAtoms(i, j)
+        if m_bond is None:
+            return "obabel (connectivity differs from SMILES)"
+        m_bond.SetBondType(t_bond.GetBondType())
+        template_bonds.add((min(i, j), max(i, j)))
+    # Bonds Open Babel perceived that the SMILES does not have are
+    # artefacts of close contacts (typically a counter-ion such as Na+
+    # sitting next to a sulfonate oxygen): drop them so the SDF has
+    # exactly the input's bond table.
+    extra = [
+        (b.GetBeginAtomIdx(), b.GetEndAtomIdx())
+        for b in fixed.GetBonds()
+        if (min(b.GetBeginAtomIdx(), b.GetEndAtomIdx()),
+            max(b.GetBeginAtomIdx(), b.GetEndAtomIdx())) not in template_bonds
+    ]
+    for i, j in extra:
+        fixed.RemoveBond(i, j)
+    try:
+        Chem.SanitizeMol(fixed)
+    except Exception as exc:  # pylint: disable=broad-except
+        return f"obabel (sanitisation failed: {type(exc).__name__}: {exc})"
+
+    fixed.SetProp("_Name", title)
+    try:
+        sdf_file.write_text(Chem.MolToMolBlock(fixed) + "$$$$\n", encoding="utf-8")
+    except OSError as exc:
+        return f"obabel (could not rewrite SDF: {exc})"
+    return "smiles"
+
+
 def _convert_arc_to_sdf(
     arc_file: Path,
     sdf_file: Path,
     timeout: int = 60,
     overwrite: bool = False,
     cancel_event: Optional[threading.Event] = None,
+    fix_bond_orders: bool = True,
 ) -> SdfResult:
     """Convert a single MOPAC ``.arc`` file to ``.sdf`` using obabel.
 
@@ -1069,6 +1202,13 @@ def _convert_arc_to_sdf(
     Open Babel converts that with ``-imop`` (which reads MOPAC Cartesian
     format correctly) rather than relying on ``.arc`` extension detection,
     which produces incorrect output in Open Babel 3.1.1.
+
+    With *fix_bond_orders* the bond table of the resulting SDF is then
+    replaced by the one implied by the original SMILES (read from the
+    ``.mop`` header next to the ``.arc``), because Open Babel's perception
+    from coordinates gets sulfonates, sulfates, N-oxides and other
+    hypervalent or charged groups wrong. See
+    :func:`_assign_bond_orders_from_smiles`.
 
     Args:
         arc_file:     Path to the ``.arc`` file produced by MOPAC.
@@ -1079,6 +1219,11 @@ def _convert_arc_to_sdf(
                       with ``status="cancelled"`` without spawning obabel.
                       When set while obabel is running, the process is
                       killed immediately. See :func:`run_command`.
+        fix_bond_orders: Re-assign bond orders / formal charges from the
+                      input SMILES via RDKit. Silently falls back to the
+                      Open Babel bond table when RDKit is not installed or
+                      the SMILES is unavailable; the outcome is recorded in
+                      ``SdfResult.bond_orders``.
 
     Returns:
         :class:`SdfResult` summarising the conversion.
@@ -1147,8 +1292,21 @@ def _convert_arc_to_sdf(
     except (ValueError, OSError):
         pass  # title fix is cosmetic; don't fail the whole result
 
+    result.bond_orders = "obabel"
+    if fix_bond_orders:
+        smiles = _read_mop_smiles(arc_file.with_suffix(".mop"))
+        if smiles is None:
+            result.bond_orders = "obabel (no SMILES in .mop header)"
+        else:
+            result.bond_orders = _assign_bond_orders_from_smiles(sdf_file, smiles, compound_id)
+        if result.bond_orders != "smiles":
+            logger.warning(
+                "[%s] SDF keeps Open Babel bond orders: %s", compound_id, result.bond_orders,
+            )
+
     result.status = "success"
     result.sdf_file = sdf_file
+    result.duration = time.monotonic() - t0
     logger.info("[%s] SDF exported in %.2fs.", compound_id, result.duration)
     return result
 
@@ -2238,6 +2396,7 @@ def export_sdf(
     timeout: int = 60,
     max_workers: int = 1,
     cancel_event: Optional[threading.Event] = None,
+    fix_bond_orders: bool = True,
 ) -> pd.DataFrame:
     """Phase 3 batch: convert optimised MOPAC ``.arc`` files to ``.sdf``.
 
@@ -2257,11 +2416,18 @@ def export_sdf(
                       any compound not yet started is skipped with
                       ``status="cancelled"`` and the in-flight obabel
                       process (if any) is killed immediately.
+        fix_bond_orders: Replace Open Babel's coordinate-perceived bond
+                      table with the bond orders and formal charges of the
+                      input SMILES (needs RDKit; falls back silently
+                      otherwise). Fixes sulfonates/sulfates, N-oxides,
+                      quaternary ammoniums etc. The per-compound outcome is
+                      in the ``bond_orders`` column.
 
     Returns:
         DataFrame with columns: ``compound_id``, ``arc_file``, ``sdf_file``,
         ``status`` (``success`` / ``failed`` / ``skipped`` / ``cancelled``),
-        ``error_message``, ``duration_s``.  Also saved to
+        ``error_message``, ``duration_s``, ``bond_orders`` (``smiles`` /
+        ``obabel`` / ``obabel (<reason>)``).  Also saved to
         ``<workdir>/sdf_results.csv``.
 
     Raises:
@@ -2283,15 +2449,22 @@ def export_sdf(
     if n == 0:
         logger.warning("No .arc files found under %s — nothing to convert.", workdir)
         return pd.DataFrame(
-            columns=["compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s"]
+            columns=[
+                "compound_id", "arc_file", "sdf_file", "status", "error_message",
+                "duration_s", "bond_orders",
+            ]
         )
 
     logger.info("Found %d .arc file(s) to convert.", n)
 
-    run_kwargs = dict(timeout=timeout, overwrite=overwrite, cancel_event=cancel_event)
+    run_kwargs = dict(
+        timeout=timeout, overwrite=overwrite, cancel_event=cancel_event,
+        fix_bond_orders=fix_bond_orders,
+    )
 
     columns = [
         "compound_id", "arc_file", "sdf_file", "status", "error_message", "duration_s",
+        "bond_orders",
     ]
     csv_path = workdir / "sdf_results.csv"
     results: list[Optional[SdfResult]] = [None] * n

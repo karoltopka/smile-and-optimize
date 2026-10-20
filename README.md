@@ -383,12 +383,15 @@ export_sdf(
     timeout: int = 60,
     max_workers: int = 1,
     cancel_event: threading.Event | None = None,
+    fix_bond_orders: bool = True,
 ) -> pd.DataFrame
 ```
 
 Phase 3: converts optimised MOPAC `.arc` files to `.sdf` format using Open Babel. Scans `<workdir>/*/*.arc` — only compounds that completed a successful MOPAC optimisation (i.e. have an `.arc` file) are processed. Compounds whose MOPAC run failed are automatically excluded.
 
 The geometry used is extracted from the `FINAL GEOMETRY OBTAINED` block at the end of each `.arc` file, which contains the fully converged Cartesian coordinates. Open Babel reads this block using the MOPAC Cartesian input format (`-imop`) rather than the `.arc` extension, which produces incorrect output in Open Babel 3.1.1.
+
+**Bond orders.** Open Babel builds the SDF bond table from the coordinates alone, and that perception is wrong for hypervalent and charge-separated groups: sulfonates and sulfates come out as four single S–O bonds, N-oxides and quaternary ammoniums lose their formal charges, so RDKit reads radicals or refuses the file even though the geometry is fine. Because the input SMILES is stored in every `.mop` header, `export_sdf` (with `fix_bond_orders=True`, the default) re-assigns bond orders and formal charges from it using RDKit's `AssignBondOrdersFromTemplate`, keeping atom order and coordinates untouched. The `bond_orders` column of the result says what happened per compound: `smiles` (fixed), `obabel` (fix disabled) or `obabel (<reason>)` (RDKit missing, SMILES not parsable, atom count mismatch…) — in the last case the file is left exactly as Open Babel wrote it.
 
 **Parameters**
 
@@ -399,6 +402,7 @@ The geometry used is extracted from the `FINAL GEOMETRY OBTAINED` block at the e
 | `timeout` | `int` | `60` | Per-compound obabel timeout in seconds. |
 | `max_workers` | `int` | `1` | Number of parallel worker threads. |
 | `cancel_event` | `threading.Event \| None` | `None` | When set from another thread while this is running, any compound not yet started is skipped with `status="cancelled"` and the in-flight obabel process (if any) is killed immediately. See [Cancelling a running batch](#cancelling-a-running-batch). |
+| `fix_bond_orders` | `bool` | `True` | Re-assign bond orders and formal charges from the input SMILES (RDKit). Falls back to Open Babel's bond table when RDKit is unavailable. |
 
 **Returns**
 
@@ -411,7 +415,8 @@ A `DataFrame` with one row per `.arc` file found, saved to `<workdir>/sdf_result
 | `sdf_file` | Absolute path to the produced `.sdf` file, or `None`. |
 | `status` | `success`, `failed`, `skipped`, or `cancelled`. |
 | `error_message` | Human-readable error description, or `None` on success. |
-| `duration_s` | Wall-clock time for the Open Babel conversion. |
+| `duration_s` | Wall-clock time for the conversion (Open Babel + bond-order fix). |
+| `bond_orders` | `smiles` (bond table taken from the input SMILES), `obabel` (fix disabled) or `obabel (<reason>)` (fix attempted but not applied). |
 
 **Raises**
 
